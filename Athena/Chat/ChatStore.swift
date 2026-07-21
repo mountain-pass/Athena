@@ -116,9 +116,15 @@ final class ChatStore: ObservableObject {
     /// True while the current agent turn was started by voice → speak the reply.
     private var currentTurnViaVoice = false
     private var streamingSpeechStarted = false
-    /// Index in `allMessages` at which the current turn's reply must appear.
-    /// Without this, a history refresh can hand TTS the PREVIOUS answer.
-    private var turnAnchorIndex = 0
+    /// A voice turn is waiting for its reply to be spoken. Survives premature
+    /// turn-end markers and history refreshes — cleared only when we actually
+    /// speak, when a new message is sent, or after a timeout.
+    private var pendingVoiceReply = false
+    private var pendingVoiceSince: Date?
+    /// The last assistant text at send time — never speak this again.
+    private var previousAssistantText = ""
+    /// The last text we spoke — dedupe across refreshes.
+    private var lastSpokenText = ""
     private var historyRefreshTask: Task<Void, Never>?
 
     init(gateway: GatewayClient, voice: VoiceManager) {
@@ -174,11 +180,19 @@ final class ChatStore: ObservableObject {
         let atts = pendingAttachments
         pendingAttachments = []
         currentTurnViaVoice = viaVoice
+        pendingVoiceReply = viaVoice
+        pendingVoiceSince = viaVoice ? .now : nil
+        streamingSpeechStarted = false
+        // Remember the previous answer so neither streaming nor a history
+        // refresh can ever read the OLD reply for the NEW question.
+        previousAssistantText = allMessages.last(where: {
+            $0.role == .assistant && !$0.isToolNoise
+        })?.text ?? ""
         agentBusy = true
         turnCharCount = 0
         turnStarted = .now
-        // Anything before this point belongs to earlier turns.
-        turnAnchorIndex = allMessages.count + 1   // +1 for the user row we append next
+        noteTurnActivity()
+        startTurnWatchdog()
         // The bubble shows only what the user said; the directive rides along
         // to the agent invisibly.
         allMessages.append(ChatMessage(role: .user, text: trimmed, viaVoice: viaVoice,
@@ -190,9 +204,12 @@ final class ChatStore: ObservableObject {
         } else {
             payload = trimmed
         }
+        let sentAt = Date()
         Task {
             do {
                 _ = try await gateway.chatSend(payload, attachments: atts)
+                NSLog("[timing] chat.send returned after %.1fs",
+                      Date().timeIntervalSince(sentAt))
             } catch {
                 self.agentBusy = false
                 self.allMessages.append(ChatMessage(role: .system, text: "Send failed: \(error.localizedDescription)"))
@@ -284,10 +301,9 @@ final class ChatStore: ObservableObject {
             $0.id == $1.id && $0.text == $1.text
         }
         guard !sameContent else {
-            if agentBusy, let last = loaded.last, last.role == .assistant {
-                turnCharCount = max(turnCharCount, last.text.count)
-                finishTurn()
-            }
+            // Even with no new rows, a pending voice reply may now qualify
+            // (e.g. the busy flag was cleared early by a lifecycle marker).
+            maybeSpeakPendingReply()
             return
         }
 
@@ -296,15 +312,23 @@ final class ChatStore: ObservableObject {
         if agentBusy, let last = loaded.last, last.role == .assistant {
             turnCharCount = max(turnCharCount, last.text.count)
             finishTurn()
+        } else {
+            // Not busy any more — but the reply may have just arrived.
+            maybeSpeakPendingReply()
         }
     }
 
     private func ingestAssistantUpdate(_ payload: JSONValue) {
         // Only the main session belongs in this transcript — background
         // sessions (source suggestions, config lookups) stay invisible.
-        if let sk = payload["sessionKey"]?.stringValue, sk != GatewayClient.mainSessionKey {
-            return   // config / todo side-sessions stay out of the transcript
+        if let sk = payload["sessionKey"]?.stringValue,
+           !GatewayClient.isMainSession(sk) {
+            return   // cron / config / todo side-sessions stay out of the transcript
         }
+        // Anything for this session counts as progress — including tool calls
+        // and lifecycle markers below. A turn that spends five minutes running
+        // tools is alive, and the watchdog must not kill it.
+        noteTurnActivity()
         // Ignore echoes of our own user messages.
         let role = payload["role"]?.stringValue ?? payload["message"]?["role"]?.stringValue
         if role == "user" { return }
@@ -320,11 +344,10 @@ final class ChatStore: ObservableObject {
         }
         if agentBusy { turnCharCount = max(turnCharCount, text.count) }
 
-        // Speak as the reply arrives — but only the reply to THIS turn.
-        // A history refresh can deliver the previous answer; without the
-        // anchor check we'd read it aloud again.
-        let belongsToThisTurn = allMessages.count >= turnAnchorIndex
-        if currentTurnViaVoice, agentBusy, belongsToThisTurn {
+        // Speak as the reply arrives — but never the PREVIOUS answer
+        // (event replays at turn start used to cause exactly that).
+        if pendingVoiceReply, agentBusy,
+           text != previousAssistantText, text != lastSpokenText {
             if !streamingSpeechStarted {
                 streamingSpeechStarted = true
                 voice.beginStreamingSpeech()
@@ -342,29 +365,108 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    private func finishTurn() {
-        guard agentBusy else { return }
-        if let start = turnStarted {
-            let elapsed = max(0.5, Date().timeIntervalSince(start))
-            lastTokPerSec = Double(turnCharCount) / 4.0 / elapsed
-            totalTurnTokens += turnCharCount / 4
-        }
-        agentBusy = false
-        // Speak the last real reply from THIS turn — never a tool payload,
-        // and never an answer from an earlier exchange.
-        if currentTurnViaVoice,
-           let idx = allMessages.lastIndex(where: { $0.role == .assistant && !$0.isToolNoise }),
-           idx >= turnAnchorIndex - 1 {
-            allMessages[idx].isVoiceReply = true
-            if streamingSpeechStarted {
-                // Already speaking — just flush whatever wasn't covered.
-                voice.endStreamingSpeech(fullText: allMessages[idx].text)
-            } else {
-                voice.speak(allMessages[idx].text)
+    // MARK: Turn watchdog
+    //
+    // `finishTurn()` runs only when the gateway sends a final event. If that
+    // event never arrives — the socket dropped, the run died server-side, the
+    // agent hung — `agentBusy` stayed true forever, leaving the abort button
+    // stuck on screen and no indication that anything was wrong.
+
+    private var lastTurnActivity: Date?
+    private var turnWatchdog: Task<Void, Never>?
+    /// How long a turn may go silent before we assume it's dead.
+    private let turnSilenceLimit: TimeInterval = 120
+
+    /// Called whenever anything arrives for the current turn.
+    func noteTurnActivity() { lastTurnActivity = .now }
+
+    private func startTurnWatchdog() {
+        turnWatchdog?.cancel()
+        turnWatchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard let self, self.agentBusy else { return }
+                let quiet = Date().timeIntervalSince(self.lastTurnActivity ?? .now)
+                guard quiet > self.turnSilenceLimit else { continue }
+                NSLog("[chat] no activity for %.0fs — releasing stuck turn", quiet)
+                self.allMessages.append(ChatMessage(
+                    role: .system,
+                    text: "No response from OpenClaw for \(Int(quiet))s. The turn was released — check the gateway connection and try again."))
+                self.finishTurn()
+                return
             }
         }
-        streamingSpeechStarted = false
+    }
+
+    private func finishTurn() {
+        turnWatchdog?.cancel()
+        turnWatchdog = nil
+        if agentBusy {
+            if let started = turnStarted {
+                let elapsed = max(0.5, Date().timeIntervalSince(started))
+                lastTokPerSec = Double(turnCharCount) / 4.0 / elapsed
+                totalTurnTokens += turnCharCount / 4
+            }
+            agentBusy = false
+        }
+        // NOTE: does NOT clear pendingVoiceReply. A textless "final" marker
+        // can arrive before the reply text does; the pending flag must
+        // survive so a later history refresh can still speak.
+        maybeSpeakPendingReply()
+    }
+
+    /// Speaks the reply to a pending voice turn, whenever it shows up.
+    /// Identification is by ORDER (assistant row after the last user row) and
+    /// text (must differ from the previous answer) — index arithmetic breaks
+    /// across history refreshes because local and gateway row counts differ.
+    func maybeSpeakPendingReply() {
+        guard pendingVoiceReply else { return }
+
+        // Give up quietly on ancient turns.
+        if let since = pendingVoiceSince, Date().timeIntervalSince(since) > 300 {
+            pendingVoiceReply = false
+            currentTurnViaVoice = false
+            return
+        }
+
+        guard let userIdx = allMessages.lastIndex(where: { $0.role == .user }),
+              let replyIdx = allMessages.lastIndex(where: {
+                  $0.role == .assistant && !$0.isToolNoise
+              }),
+              replyIdx > userIdx else { return }   // reply not in yet — keep waiting
+
+        let reply = allMessages[replyIdx].text
+        guard !reply.isEmpty,
+              reply != previousAssistantText,
+              reply != lastSpokenText else { return }
+
+        allMessages[replyIdx].isVoiceReply = true
+        lastSpokenText = reply
+        pendingVoiceReply = false
         currentTurnViaVoice = false
+
+        if streamingSpeechStarted {
+            voice.endStreamingSpeech(fullText: reply)
+        } else {
+            voice.speak(reply)
+        }
+        streamingSpeechStarted = false
+        NSLog("[voice] speaking reply (%d chars)", reply.count)
+    }
+
+    /// The gateway's talk-voice plugin wraps spoken replies in `[[tts: … ]]`.
+    /// Unwrap it so the transcript reads normally and TTS speaks the words
+    /// rather than the directive.
+    static func unwrapTTSDirective(_ text: String) -> String {
+        var out = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // [[tts: ...]] possibly repeated / with attributes.
+        while let start = out.range(of: "[[tts:", options: [.caseInsensitive]),
+              let end = out.range(of: "]]", range: start.upperBound..<out.endIndex) {
+            let inner = String(out[start.upperBound..<end.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            out = out.replacingCharacters(in: start.lowerBound..<end.upperBound, with: inner)
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Removes the invisible protocol prefix so the user's bubble shows only
@@ -386,6 +488,11 @@ final class ChatStore: ObservableObject {
 
     /// Pulls display text out of the several shapes gateway events/history use.
     static func extractText(_ v: JSONValue) -> String? {
+        if let raw = rawText(v) { return unwrapTTSDirective(raw) }
+        return nil
+    }
+
+    private static func rawText(_ v: JSONValue) -> String? {
         if let s = v["text"]?.stringValue { return s }
         if let s = v["delta"]?.stringValue { return s }
         if let s = v["content"]?.stringValue { return s }

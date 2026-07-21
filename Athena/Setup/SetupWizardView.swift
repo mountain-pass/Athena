@@ -9,7 +9,7 @@ import SwiftUI
 ///    the gateway locally, then drives OpenClaw's onboarding *wizard over RPC*
 ///    so the whole CLI setup happens inside this native UI.
 struct SetupWizardView: View {
-    enum Step { case welcome, connectRemote, installLocal, onboarding, done }
+    enum Step { case welcome, connectRemote, installLocal, onboarding, models, done }
 
     @EnvironmentObject var app: AppState
     @EnvironmentObject var gateway: GatewayClient
@@ -34,7 +34,8 @@ struct SetupWizardView: View {
                 case .welcome: welcome
                 case .connectRemote: connectRemote
                 case .installLocal: installLocal
-                case .onboarding: OnboardingWizardView(onFinished: finish)
+                case .onboarding: OnboardingWizardView(onFinished: { step = .models })
+                case .models: ModelSetupStep(onContinue: finish)
                 case .done: doneView
                 }
             }

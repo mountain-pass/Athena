@@ -18,6 +18,17 @@ packages:
   speech-swift:
     url: https://github.com/soniqo/speech-swift
     branch: main
+  mlx-swift:
+    url: https://github.com/ml-explore/mlx-swift
+    from: 0.18.0
+  # Parakeet TDT speech-to-text on the Apple Neural Engine. Replaces Apple's
+  # SFSpeechRecognizer, which is tuned for short commands and both misrecognises
+  # long-form speech and goes dormant after a pause. Parakeet is a BATCH model:
+  # we buffer audio while SPACE is held and transcribe on release, so pauses
+  # need no handling at all.
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio
+    from: 0.12.4
 
 targets:
   Athena:
@@ -26,8 +37,14 @@ targets:
     dependencies:
       - package: kokoro-swift
         product: Kokoro
+      # Direct MLX access so we can cap and flush its GPU buffer cache —
+      # otherwise it grows unbounded across synthesis calls.
+      - package: mlx-swift
+        product: MLX
       - package: speech-swift
         product: CosyVoiceTTS
+      - package: FluidAudio
+        product: FluidAudio
     sources:
       - path: Athena
     settings:
@@ -48,7 +65,10 @@ targets:
         CFBundleName: Athena
         LSMinimumSystemVersion: "15.0"
         NSMicrophoneUsageDescription: "Athena uses the microphone for push-to-talk voice commands."
-        NSSpeechRecognitionUsageDescription: "Athena transcribes your voice on-device to send commands to your agent."
+        # Only reached if you pick the built-in macOS recognizer in Settings.
+        # The default engine (Parakeet) runs locally and never uses this API,
+        # so this prompt is not shown unless you opt in.
+        NSSpeechRecognitionUsageDescription: "Only used if you choose the built-in macOS recognizer for voice input. Athena's default speech engine runs entirely on your Mac and does not use this."
         NSAppleEventsUsageDescription: "Athena can open Terminal to install OpenClaw."
         NSHighResolutionCapable: true
         # Allow plaintext ws:// to the gateway. Tailscale traffic is already

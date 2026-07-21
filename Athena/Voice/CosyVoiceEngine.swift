@@ -22,8 +22,9 @@ import CosyVoiceTTS
 final class CosyVoiceEngine: ObservableObject {
 
     enum Variant: String, CaseIterable, Identifiable {
-        case fourBit = "4-bit (~1.2 GB, fastest)"
-        case eightBit = "8-bit (~1.4 GB, balanced)"
+        // NOTE: 4-bit exists on HuggingFace but this runtime rejects it —
+        // "LLM bundles must be 8-bit quantized or 16-bit/bf16 plain Linear".
+        case eightBit = "8-bit (~1.4 GB, recommended)"
         case eightBitFull = "8-bit full (~1.6 GB)"
         case bf16 = "bf16 (~2.1 GB, best quality)"
         var id: String { rawValue }
@@ -31,7 +32,6 @@ final class CosyVoiceEngine: ObservableObject {
         /// HuggingFace repo for this bundle.
         var modelID: String {
             switch self {
-            case .fourBit: "aufklarer/CosyVoice3-0.5B-MLX-4bit"
             case .eightBit: "aufklarer/CosyVoice3-0.5B-MLX-8bit"
             case .eightBitFull: "aufklarer/CosyVoice3-0.5B-MLX-8bit-full"
             case .bf16: "aufklarer/CosyVoice3-0.5B-MLX-bf16"
@@ -68,6 +68,9 @@ final class CosyVoiceEngine: ObservableObject {
     @Published private(set) var status: Status = .notLoaded
     /// Non-nil after a failure so the UI can offer a retry.
     @Published private(set) var lastFailure: String?
+    /// Called when an unsupported variant forces a switch, so the picker
+    /// reflects what's actually loaded.
+    var onVariantFallback: ((Variant) -> Void)?
 
     /// Reference clip for zero-shot cloning. CosyVoice has no built-in voice
     /// catalogue — you pick a voice by giving it a few seconds of audio.
@@ -95,22 +98,60 @@ final class CosyVoiceEngine: ObservableObject {
     /// Borrows a Kokoro voice as a CosyVoice reference: synthesize a sample
     /// with Kokoro, then clone it. This is how soniqo's own docs demo cloning,
     /// and it gives CosyVoice a usable voice picker.
+    /// Step-by-step status so the user can see what's happening — this takes
+    /// a while and previously looked like nothing was going on.
+    @Published private(set) var referenceStatus: String?
+
     func buildReference(fromKokoroVoice voiceID: String, label: String,
                         using kokoro: KokoroEngine) async {
         buildingReference = true
-        defer { buildingReference = false }
+        lastFailure = nil
+        defer { buildingReference = false; referenceStatus = nil }
+
+        // Reuse a clip we already generated for this voice.
+        let url = Self.referenceDirectory.appendingPathComponent("\(voiceID).wav")
+        if FileManager.default.fileExists(atPath: url.path) {
+            voiceSamplePath = url.path
+            voiceSampleLabel = label
+            referenceStatus = "Using saved clip"
+            return
+        }
+
+        // Kokoro has to be present to generate the sample — do it here rather
+        // than failing silently.
+        if case .ready = kokoro.status {} else {
+            referenceStatus = kokoro.isDownloaded
+                ? "Loading Kokoro model…"
+                : "Downloading Kokoro model (~330 MB)…"
+            await kokoro.prepare()
+        }
+        guard case .ready = kokoro.status else {
+            lastFailure = """
+                Kokoro isn't available, so this voice can't be cloned. \
+                Switch Engine to Kokoro, download the model, then come back — \
+                or record your own clip instead.
+                """
+            return
+        }
+
         do {
+            referenceStatus = "Synthesizing sample in \(label)…"
             let sampleText = """
                 The quick brown fox jumps over the lazy dog. \
                 I can help you with your schedule, your news, and anything else you need today.
                 """
             let wav = try await kokoro.synthesize(text: sampleText, voice: voiceID)
+            guard wav.count > 1024 else {
+                lastFailure = "Kokoro produced no audio for \(label)."
+                return
+            }
+            referenceStatus = "Saving reference clip…"
             try FileManager.default.createDirectory(at: Self.referenceDirectory,
                                                     withIntermediateDirectories: true)
-            let url = Self.referenceDirectory.appendingPathComponent("\(voiceID).wav")
             try wav.write(to: url)
             voiceSamplePath = url.path
             voiceSampleLabel = label
+            referenceStatus = "Ready — CosyVoice will clone this voice"
         } catch {
             lastFailure = "Could not build reference: \(error.localizedDescription)"
         }
@@ -119,6 +160,12 @@ final class CosyVoiceEngine: ObservableObject {
     func clearReference() {
         voiceSamplePath = ""
         voiceSampleLabel = ""
+    }
+
+    /// Drops the loaded model (used when the variant changes).
+    func unload() {
+        Task { await runner.unload() }
+        status = .notLoaded
     }
 
     /// The 8 built-in emotion tags. The agent can emit these inline and
@@ -139,6 +186,26 @@ final class CosyVoiceEngine: ObservableObject {
     static var cacheDirectory: URL {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("qwen3-speech", isDirectory: true)
+    }
+
+    /// Shared representation so every model download renders identically.
+    var phase: ModelPhase {
+        switch status {
+        case .notLoaded:
+            return isDownloaded
+                ? .loading("Downloaded — not yet loaded")
+                : .absent("Not downloaded — spoken replies will use the system voice")
+        case .downloading(let f, _): return .downloading(f)
+        case .loading:               return .loading(status.label)
+        case .ready:                 return .ready(status.label)
+        case .unavailable(let why):  return .failed(why)
+        }
+    }
+
+    /// Extra text under the progress bar (which file, how far).
+    var progressDetail: String? {
+        if case .downloading(_, let detail) = status, !detail.isEmpty { return detail }
+        return nil
     }
 
     var isDownloaded: Bool {
@@ -168,6 +235,16 @@ final class CosyVoiceEngine: ObservableObject {
             status = .ready
         } catch {
             let message = error.localizedDescription
+            // Unsupported quantisation → fall back to 8-bit automatically
+            // rather than leaving the user stuck on a dead setting.
+            if message.contains("8-bit quantized") || message.contains("plain Linear"),
+               variant != .eightBit {
+                NSLog("[cosyvoice] %@ unsupported — retrying with 8-bit", variant.rawValue)
+                onVariantFallback?(.eightBit)
+                await runner.unload()
+                await prepare(variant: .eightBit)
+                return
+            }
             lastFailure = message
             status = .unavailable(message)
         }
@@ -196,11 +273,6 @@ final class CosyVoiceEngine: ObservableObject {
         #else
         throw TTSError.notAvailable
         #endif
-    }
-
-    func unload() {
-        Task { await runner.unload() }
-        status = .notLoaded
     }
 
     enum TTSError: LocalizedError {
@@ -241,6 +313,7 @@ actor CosyVoiceRunner {
               progress: @escaping @Sendable (Double, String) -> Void) async throws {
         #if canImport(CosyVoiceTTS)
         guard model == nil else { return }
+        MLXMemory.configure()
         model = try await CosyVoiceTTSModel.fromPretrained(
             modelId: modelID,
             progressHandler: { fraction, detail in progress(fraction, detail) })
@@ -253,6 +326,7 @@ actor CosyVoiceRunner {
         speaker = nil
         cachedEmbedding = nil
         cachedSamplePath = nil
+        MLXMemory.flush()
         #endif
     }
 
@@ -282,6 +356,7 @@ actor CosyVoiceRunner {
                        voiceSample: URL? = nil) async throws -> Data {
         #if canImport(CosyVoiceTTS)
         guard let model else { throw CosyVoiceEngine.TTSError.notReady }
+        defer { MLXMemory.flush() }
 
         // Cloned voice path.
         if let voiceSample, FileManager.default.fileExists(atPath: voiceSample.path),

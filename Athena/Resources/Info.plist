@@ -44,6 +44,6 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Athena uses the microphone for push-to-talk voice commands.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Athena transcribes your voice on-device to send commands to your agent.</string>
+	<string>Only used if you choose the built-in macOS recognizer for voice input. Athena's default speech engine runs entirely on your Mac and does not use this.</string>
 </dict>
 </plist>

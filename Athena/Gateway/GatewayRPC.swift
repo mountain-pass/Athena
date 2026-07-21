@@ -16,6 +16,20 @@ extension GatewayClient {
 
     static let mainSessionKey = "athena-main"
 
+    /// Does this session key refer to the main chat?
+    ///
+    /// The gateway uses TWO forms for the same session: RPC responses carry
+    /// the bare key ("athena-main"), while events carry it fully qualified
+    /// ("agent:main:athena-main"). Comparing against the bare key alone
+    /// silently discarded every streamed event — replies only ever appeared
+    /// via history polling, and the turn never registered as finished.
+    ///
+    /// Sub-sessions must still be excluded: cron runs look like
+    /// "agent:main:cron:<jobId>:run:<runId>", which correctly fails both tests.
+    static func isMainSession(_ key: String) -> Bool {
+        key == mainSessionKey || key.hasSuffix(":" + mainSessionKey)
+    }
+
     func chatHistory(sessionKey: String = mainSessionKey, limit: Int = 200) async throws -> JSONValue {
         try await request("chat.history", .from(["sessionKey": sessionKey, "limit": limit]))
     }

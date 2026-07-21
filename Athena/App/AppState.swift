@@ -51,12 +51,9 @@ final class AppState: ObservableObject {
             .store(in: &cancellables)
         // Warm the TTS model in the background so the first spoken reply
         // isn't waiting on a cold model load (the biggest source of lag).
-        if voice.engine == .kokoro, voice.kokoro.isDownloaded {
-            let kokoro = voice.kokoro          // capture the value, not self
-            Task.detached(priority: .utility) {
-                await kokoro.prepare()
-            }
-        }
+        // Warm whichever engine is selected. Loading a 1.4 GB model inside the
+        // first reply is what made speech take minutes to start.
+        voice.warmCurrentEngine()
 
         // Reconnect recovery: flush anything deferred while offline and
         // catch up on what the agent did in the meantime.

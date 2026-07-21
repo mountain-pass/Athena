@@ -231,7 +231,12 @@ final class TodoStore: ObservableObject {
     func startSync() {
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.pullAgentUpdates() }
+            Task { @MainActor in
+                guard let self else { return }
+                // Idle when nothing is in flight — no pointless round-trips.
+                guard !self.activeTasks.isEmpty || !self.runningTasks.isEmpty else { return }
+                await self.pullAgentUpdates()
+            }
         }
         Task { await pullAgentUpdates() }
     }
@@ -268,6 +273,7 @@ final class TodoStore: ObservableObject {
     func pullAgentUpdates() async {
         guard gateway.state.isConnected else { return }   // stand down while offline
         guard !syncing else { return }
+        guard !activeTasks.isEmpty || !runningTasks.isEmpty else { return }
         syncing = true
         defer { syncing = false }
 
@@ -280,9 +286,20 @@ final class TodoStore: ObservableObject {
     /// How many assistant messages we've already turned into progress notes.
     private var consumedSessionMessages: [String: Int] = [:]
 
+    /// Tasks still worth polling. A finished task (result in hand) or one
+    /// blocked on the user produces nothing new — polling it forever just
+    /// hammers the gateway.
+    var activeTasks: [TodoItem] {
+        items.filter { task in
+            guard task.owner == .athena, !task.done else { return false }
+            if task.status == .readyForReview, task.hasResult { return false }
+            if task.status == .waitingOnUser { return false }   // resumes on answer
+            return true
+        }
+    }
+
     private func pullFromTaskSessions() async {
-        let delegated = items.filter { $0.owner == .athena && !$0.done }
-        for task in delegated {
+        for task in activeTasks {
             let key = Self.sessionKey(for: task)
             guard let history = try? await gateway.chatHistory(sessionKey: key, limit: 40)
             else { continue }

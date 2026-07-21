@@ -13,11 +13,31 @@ cd "$(dirname "$0")/.."
 APP_NAME=Athena
 DERIVED=.build/xcode
 
+SOURCE_MANIFEST=.build/sources.sha
+
+# Fingerprint of the source file *set* (names, not contents). XcodeGen globs
+# the Athena/ directory, so the project only needs regenerating when files are
+# added, removed or renamed — not on every edit.
+source_fingerprint() {
+  find "$APP_NAME" -name '*.swift' -o -name '*.plist' -o -name '*.entitlements' \
+    | sort | shasum | cut -d' ' -f1
+}
+
 generate_if_needed() {
-  # Regenerate when project.yml is newer than the project, or files were added.
-  if [ ! -d "$APP_NAME.xcodeproj" ] || [ project.yml -nt "$APP_NAME.xcodeproj" ]; then
+  local fingerprint
+  fingerprint="$(source_fingerprint)"
+
+  # NOTE: checking only `project.yml -nt project` is not enough — that misses
+  # newly added source files, which then fail to compile with a baffling
+  # "Cannot find X in scope" even though the file is right there on disk.
+  if [ ! -d "$APP_NAME.xcodeproj" ] \
+     || [ project.yml -nt "$APP_NAME.xcodeproj" ] \
+     || [ ! -f "$SOURCE_MANIFEST" ] \
+     || [ "$fingerprint" != "$(cat "$SOURCE_MANIFEST")" ]; then
     echo "→ regenerating project…"
     xcodegen
+    mkdir -p "$(dirname "$SOURCE_MANIFEST")"
+    printf '%s' "$fingerprint" > "$SOURCE_MANIFEST"
   fi
 }
 

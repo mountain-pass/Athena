@@ -26,6 +26,14 @@ final class KokoroEngine: ObservableObject {
         case ready
         case unavailable(String)
 
+        /// True while a download or load is in progress.
+        var isBusy: Bool {
+            switch self {
+            case .downloading, .loading: true
+            default: false
+            }
+        }
+
         var label: String {
             switch self {
             case .notLoaded: "Not loaded — click below to download (~330MB, one time)"
@@ -38,6 +46,23 @@ final class KokoroEngine: ObservableObject {
     }
 
     @Published private(set) var status: Status = .notLoaded
+
+    /// Shared representation so every model download renders identically.
+    var phase: ModelPhase {
+        switch status {
+        case .notLoaded:
+            return isDownloaded
+                ? .loading("Downloaded — not yet loaded")
+                : .absent("Not downloaded — spoken replies will use the system voice")
+        case .downloading(let f): return .downloading(f)
+        case .loading:            return .loading(status.label)
+        case .ready:
+            if warming { return .loading("Warming up — first sentence will be instant after this") }
+            return .ready(isWarm ? "Ready — warm, speaks instantly"
+                                 : "Loaded — warming on first use")
+        case .unavailable(let why): return .failed(why)
+        }
+    }
 
     /// Popular English voices (the package ships 54 across 8 languages).
     static let voices: [(id: String, label: String)] = [
@@ -132,6 +157,51 @@ final class KokoroEngine: ObservableObject {
         try await downloader.download(from: weightsURL, to: Self.weightsURL) { fraction in
             Task { @MainActor in self.status = .downloading(fraction) }
         }
+    }
+
+    /// Voices already exercised — MLX has compiled its graph and the voice
+    /// file is downloaded, so these speak instantly.
+    @Published private(set) var warmVoices: Set<String> = []
+    @Published private(set) var warming = false
+
+    var isWarm: Bool { !warmVoices.isEmpty }
+
+    /// Runs one throwaway synthesis so the first *real* sentence is instant.
+    ///
+    /// Loading the model isn't enough: the first inference triggers an MLX
+    /// graph compile, and each voice is fetched from HuggingFace on demand.
+    /// Doing that here means the user never waits for it mid-conversation.
+    func warmUp(voice: String) async {
+        guard !warmVoices.contains(voice), !warming else { return }
+        if case .ready = status {} else { await prepare() }
+        guard case .ready = status else { return }
+
+        warming = true
+        defer { warming = false }
+        let started = Date()
+        do {
+            // Short and silent — we discard the audio.
+            _ = try await synthesize(text: "Ready.", voice: voice)
+            warmVoices.insert(voice)
+            NSLog("[kokoro] warmed '%@' in %.1fs", voice, Date().timeIntervalSince(started))
+        } catch {
+            NSLog("[kokoro] warm-up failed for '%@': %@", voice, error.localizedDescription)
+        }
+    }
+
+    /// Frees the model from memory without deleting the downloaded weights.
+    func unload() {
+        warmVoices.removeAll()
+        Task { await runner.unload() }
+        status = .notLoaded
+    }
+
+    /// Clears any failure and reloads from scratch.
+    func retry() async {
+        cancelDownload()
+        await runner.unload()
+        status = .notLoaded
+        await prepare()
     }
 
     /// Cancels an in-flight download.
