@@ -34,6 +34,7 @@ enum ContentBlock: Identifiable {
     case paragraph(AttributedString)
     case heading(String, level: Int)
     case bullet([AttributedString])
+    case table(header: [String], rows: [[String]])
     case code(String, language: String)
     case json(String)          // pretty-printed
     case html(String)
@@ -44,6 +45,7 @@ enum ContentBlock: Identifiable {
         case .paragraph(let a): "p-\(String(a.characters).hashValue)"
         case .heading(let s, let l): "h\(l)-\(s.hashValue)"
         case .bullet(let items): "ul-\(items.count)-\(items.first.map { String($0.characters).hashValue } ?? 0)"
+        case .table(let header, let rows): "tbl-\(header.joined().hashValue)-\(rows.count)"
         case .code(let s, _): "code-\(s.hashValue)"
         case .json(let s): "json-\(s.hashValue)"
         case .html(let s): "html-\(s.hashValue)"
@@ -102,6 +104,31 @@ enum ContentBlock: Identifiable {
         var blocks: [ContentBlock] = []
         var paragraph: [String] = []
         var bullets: [AttributedString] = []
+        var tableLines: [String] = []
+
+        func flushTable() {
+            defer { tableLines = [] }
+            guard tableLines.count >= 2 else {
+                // Not a real table — treat as plain text.
+                paragraph.append(contentsOf: tableLines)
+                return
+            }
+            func cells(_ line: String) -> [String] {
+                line.trimmingCharacters(in: CharacterSet(charactersIn: "| "))
+                    .components(separatedBy: "|")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+            }
+            let header = cells(tableLines[0])
+            // Second line should be the --- separator.
+            let separatorIndex = tableLines.firstIndex {
+                $0.contains("---")
+            }
+            let bodyStart = (separatorIndex == 1) ? 2 : 1
+            let rows = tableLines.dropFirst(bodyStart)
+                .map(cells)
+                .filter { !$0.allSatisfy(\.isEmpty) }
+            blocks.append(.table(header: header, rows: Array(rows)))
+        }
 
         func flushParagraph() {
             guard !paragraph.isEmpty else { return }
@@ -117,6 +144,15 @@ enum ContentBlock: Identifiable {
 
         for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+
+            // Markdown tables: consecutive lines starting with "|".
+            if line.hasPrefix("|"), line.dropFirst().contains("|") {
+                flushParagraph(); flushBullets()
+                tableLines.append(line)
+                continue
+            } else if !tableLines.isEmpty {
+                flushTable()
+            }
 
             if line.isEmpty { flushParagraph(); flushBullets(); continue }
 
@@ -143,6 +179,7 @@ enum ContentBlock: Identifiable {
             flushBullets()
             paragraph.append(line)
         }
+        if !tableLines.isEmpty { flushTable() }
         flushParagraph()
         flushBullets()
         return blocks
@@ -199,6 +236,9 @@ private struct BlockView: View {
                 }
             }
 
+        case .table(let header, let rows):
+            TableBlock(header: header, rows: rows)
+
         case .code(let code, let language):
             CodeBox(code: code, badge: language.isEmpty ? "code" : language,
                     tint: Theme.blue)
@@ -233,6 +273,57 @@ private struct BlockView: View {
             try? html.write(to: file, atomically: true, encoding: .utf8)
             await MainActor.run { NSWorkspace.shared.open(file) }
         }
+    }
+}
+
+/// Renders a markdown table as an aligned grid with zebra striping.
+private struct TableBlock: View {
+    let header: [String]
+    let rows: [[String]]
+
+    private var columnCount: Int {
+        max(header.count, rows.map(\.count).max() ?? 0)
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 0) {
+                // Header
+                GridRow {
+                    ForEach(0..<columnCount, id: \.self) { column in
+                        Text(column < header.count ? header[column] : "")
+                            .font(Theme.mono(10, weight: .bold))
+                            .foregroundStyle(Theme.amber)
+                            .padding(.vertical, 7)
+                    }
+                }
+                Divider().overlay(Theme.border).gridCellColumns(columnCount)
+
+                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                    GridRow {
+                        ForEach(0..<columnCount, id: \.self) { column in
+                            Text(cleanCell(column < row.count ? row[column] : ""))
+                                .font(Theme.mono(10.5))
+                                .foregroundStyle(column == 0 ? Theme.text : Theme.textDim)
+                                .padding(.vertical, 6)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .background(index.isMultiple(of: 2) ? Color.clear : Theme.panel.opacity(0.4))
+                }
+            }
+            .padding(.horizontal, 12)
+        }
+        .background(Theme.bg.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border, lineWidth: 1))
+    }
+
+    /// Strips inline bold/italic markers inside cells.
+    private func cleanCell(_ text: String) -> String {
+        text.replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "__", with: "")
+            .trimmingCharacters(in: .whitespaces)
     }
 }
 

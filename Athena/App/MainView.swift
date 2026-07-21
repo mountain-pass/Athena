@@ -150,12 +150,15 @@ private struct OfflineBanner: View {
     var body: some View {
         HStack(spacing: 10) {
             Circle().fill(Theme.red).frame(width: 7, height: 7)
-            Text(gateway.state == .connecting ? "Reconnecting to gateway…"
-                 : "Gateway offline\(gateway.lastError.map { " — \($0)" } ?? "")")
+            Text(gateway.state == .connecting
+                 ? "Reconnecting to gateway…"
+                 : (gateway.lastError ?? "Gateway offline"))
                 .font(Theme.mono(11))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
+            Text("· work continues on the gateway")
+                .font(Theme.mono(9)).foregroundStyle(Theme.textFaint)
             Spacer()
             Button {
                 gateway.connect()

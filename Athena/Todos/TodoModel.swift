@@ -22,6 +22,23 @@ struct TodoItem: Identifiable, Codable, Equatable {
             case .readyForReview: "Ready for review"
             }
         }
+        /// Compact form for the narrow list row.
+        var shortLabel: String {
+            switch self {
+            case .open: "queued"
+            case .working: "working"
+            case .waitingOnUser: "needs you"
+            case .readyForReview: "ready"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .open: "circle.dotted"
+            case .working: "gearshape.fill"
+            case .waitingOnUser: "exclamationmark.circle.fill"
+            case .readyForReview: "checkmark.circle.fill"
+            }
+        }
         var tint: Color {
             switch self {
             case .open: Theme.textFaint
@@ -41,12 +58,17 @@ struct TodoItem: Identifiable, Codable, Equatable {
     var percent: Int? = nil
     var progress: [ProgressNote] = []
     var questions: [AgentQuestion] = []
+    /// The actual deliverable — what the user asked for. Rendered prominently
+    /// once the agent finishes, separate from the progress chatter.
+    var result: String? = nil
+    var resultAt: Date? = nil
     var createdAt: Date = .now
     var updatedAt: Date = .now
     var dueAt: Date? = nil
 
     var openQuestions: [AgentQuestion] { questions.filter { $0.answer == nil } }
     var needsAttention: Bool { !openQuestions.isEmpty || status == .waitingOnUser }
+    var hasResult: Bool { !(result ?? "").isEmpty }
 }
 
 struct ProgressNote: Identifiable, Codable, Equatable {

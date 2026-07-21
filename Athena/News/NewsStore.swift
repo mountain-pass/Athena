@@ -224,6 +224,10 @@ final class NewsStore: ObservableObject {
     static let collectionJobName = "athena-news-collector"
 
     func enableBackgroundCollection(hourly: Bool) {
+        guard gateway.state.isConnected else {
+            syncStatus = "✗ Gateway offline — reconnect and try again"
+            return
+        }
         Task {
             do {
                 let jobs = try await gateway.cronList()
@@ -281,6 +285,10 @@ final class NewsStore: ObservableObject {
 
     /// Creates/updates the daily cron job on the gateway.
     func syncToGateway() {
+        guard gateway.state.isConnected else {
+            syncStatus = "✗ Gateway offline — reconnect and try again"
+            return
+        }
         Task {
             syncStatus = "Syncing…"
             do {

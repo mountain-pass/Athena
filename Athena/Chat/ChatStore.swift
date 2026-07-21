@@ -116,6 +116,9 @@ final class ChatStore: ObservableObject {
     /// True while the current agent turn was started by voice → speak the reply.
     private var currentTurnViaVoice = false
     private var streamingSpeechStarted = false
+    /// Index in `allMessages` at which the current turn's reply must appear.
+    /// Without this, a history refresh can hand TTS the PREVIOUS answer.
+    private var turnAnchorIndex = 0
     private var historyRefreshTask: Task<Void, Never>?
 
     init(gateway: GatewayClient, voice: VoiceManager) {
@@ -174,6 +177,8 @@ final class ChatStore: ObservableObject {
         agentBusy = true
         turnCharCount = 0
         turnStarted = .now
+        // Anything before this point belongs to earlier turns.
+        turnAnchorIndex = allMessages.count + 1   // +1 for the user row we append next
         // The bubble shows only what the user said; the directive rides along
         // to the agent invisibly.
         allMessages.append(ChatMessage(role: .user, text: trimmed, viaVoice: viaVoice,
@@ -210,8 +215,10 @@ final class ChatStore: ObservableObject {
                 guard let text = Self.extractText(row), !text.isEmpty else { continue }
                 let roleStr = row["role"]?.stringValue ?? row["sender"]?.stringValue ?? "assistant"
                 let role: ChatMessage.Role = (roleStr == "user") ? .user : .assistant
+                let display = role == .user ? Self.stripVoiceMarker(text) : text
                 loaded.append(ChatMessage(id: ChatMessage.stableID(index: index, text: text),
-                                          role: role, text: text,
+                                          role: role, text: display,
+                                          viaVoice: role == .user && display != text,
                                           isToolNoise: ChatMessage.looksLikeToolNoise(text)))
             }
             if !loaded.isEmpty { self.allMessages = loaded }
@@ -259,9 +266,12 @@ final class ChatStore: ObservableObject {
             guard let text = Self.extractText(row), !text.isEmpty else { continue }
             let roleStr = row["role"]?.stringValue ?? row["sender"]?.stringValue
                 ?? row["author"]?.stringValue ?? "assistant"
+            let isUser = roleStr == "user"
+            let display = isUser ? Self.stripVoiceMarker(text) : text
             loaded.append(ChatMessage(id: ChatMessage.stableID(index: index, text: text),
-                                      role: roleStr == "user" ? .user : .assistant,
-                                      text: text,
+                                      role: isUser ? .user : .assistant,
+                                      text: display,
+                                      viaVoice: isUser && display != text,
                                       isToolNoise: ChatMessage.looksLikeToolNoise(text)))
         }
         guard !loaded.isEmpty,
@@ -309,8 +319,12 @@ final class ChatStore: ObservableObject {
             return
         }
         if agentBusy { turnCharCount = max(turnCharCount, text.count) }
-        // Speak as the reply arrives, not after it finishes.
-        if currentTurnViaVoice {
+
+        // Speak as the reply arrives — but only the reply to THIS turn.
+        // A history refresh can deliver the previous answer; without the
+        // anchor check we'd read it aloud again.
+        let belongsToThisTurn = allMessages.count >= turnAnchorIndex
+        if currentTurnViaVoice, agentBusy, belongsToThisTurn {
             if !streamingSpeechStarted {
                 streamingSpeechStarted = true
                 voice.beginStreamingSpeech()
@@ -336,9 +350,11 @@ final class ChatStore: ObservableObject {
             totalTurnTokens += turnCharCount / 4
         }
         agentBusy = false
-        // Speak the last real reply — never a tool/search payload.
+        // Speak the last real reply from THIS turn — never a tool payload,
+        // and never an answer from an earlier exchange.
         if currentTurnViaVoice,
-           let idx = allMessages.lastIndex(where: { $0.role == .assistant && !$0.isToolNoise }) {
+           let idx = allMessages.lastIndex(where: { $0.role == .assistant && !$0.isToolNoise }),
+           idx >= turnAnchorIndex - 1 {
             allMessages[idx].isVoiceReply = true
             if streamingSpeechStarted {
                 // Already speaking — just flush whatever wasn't covered.
@@ -349,6 +365,23 @@ final class ChatStore: ObservableObject {
         }
         streamingSpeechStarted = false
         currentTurnViaVoice = false
+    }
+
+    /// Removes the invisible protocol prefix so the user's bubble shows only
+    /// what they actually said.
+    static func stripVoiceMarker(_ text: String) -> String {
+        var out = text
+        if out.hasPrefix(voiceMarker) {
+            out = String(out.dropFirst(voiceMarker.count))
+        } else if out.hasPrefix("[voice]") {
+            out = String(out.dropFirst("[voice]".count))
+            // The fallback directive adds a parenthetical — drop that too.
+            if out.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("("),
+               let close = out.firstIndex(of: ")") {
+                out = String(out[out.index(after: close)...])
+            }
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Pulls display text out of the several shapes gateway events/history use.

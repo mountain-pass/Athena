@@ -58,6 +58,17 @@ final class AppState: ObservableObject {
             }
         }
 
+        // Reconnect recovery: flush anything deferred while offline and
+        // catch up on what the agent did in the meantime.
+        gateway.events
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] event in
+                guard let self, event.name == "athena.connected" else { return }
+                self.todos.resumeAfterReconnect()
+                Task { await self.news.loadFromAgentMemory() }
+            }
+            .store(in: &cancellables)
+
         // Keep carousel auto-topic cards in step with fetched stories.
         news.onItemsUpdated = { [weak self] items in
             self?.carousel.syncAutoTopics(from: items)

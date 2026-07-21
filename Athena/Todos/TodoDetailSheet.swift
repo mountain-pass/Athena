@@ -34,7 +34,7 @@ struct TodoDetailSheet: View {
             Divider().overlay(Theme.border)
             footer
         }
-        .frame(width: 560, height: 620)
+        .frame(width: 720, height: 680)
         .background(Theme.bg)
         .onAppear {
             title = live.title
@@ -151,7 +151,55 @@ struct TodoDetailSheet: View {
             }
         }
 
-        // Progress timeline
+        // THE OUTCOME — what the user actually wanted.
+        if live.hasResult {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.seal.fill").foregroundStyle(Theme.green)
+                    SectionLabel(text: "Outcome", color: Theme.green)
+                    Spacer()
+                    if let at = live.resultAt {
+                        Text(at, format: .dateTime.hour().minute())
+                            .font(Theme.mono(9)).foregroundStyle(Theme.textFaint)
+                    }
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(live.result ?? "", forType: .string)
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                            .font(Theme.mono(9)).foregroundStyle(Theme.textDim)
+                    }.buttonStyle(.plain)
+                }
+
+                ScrollView {
+                    // Full markdown / JSON / code rendering.
+                    RichMessageView(text: live.result ?? "")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 340)
+                .padding(12)
+                .background(Theme.green.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .stroke(Theme.green.opacity(0.35), lineWidth: 1))
+
+                HStack(spacing: 10) {
+                    Button {
+                        todos.nudge(live, instruction: "Expand on the result with more detail.")
+                    } label: {
+                        Label("Ask for more", systemImage: "arrow.up.right")
+                            .font(Theme.mono(10)).foregroundStyle(Theme.amber)
+                    }.buttonStyle(.plain)
+                    Spacer()
+                }
+            }
+        } else if live.status == .readyForReview {
+            Text("Athena marked this ready but didn't return a result. Try Nudge — it'll be asked for the outcome explicitly.")
+                .font(Theme.mono(10)).foregroundStyle(Theme.textFaint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        // Progress timeline (secondary to the outcome)
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 SectionLabel(text: "Progress")

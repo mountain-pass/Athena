@@ -69,6 +69,9 @@ final class GatewayClient: ObservableObject {
         var code: String? = nil
         var details: JSONValue = .null
         var errorDescription: String? { message }
+        /// True when the failure was just "we're offline" — callers can skip
+        /// their error UI and simply retry later.
+        var isOffline: Bool { code == "OFFLINE" }
     }
 
     /// Non-nil while the gateway is waiting for this device to be approved.
@@ -132,7 +135,12 @@ final class GatewayClient: ObservableObject {
     // MARK: RPC
 
     func request(_ method: String, _ params: JSONValue = .object([:])) async throws -> JSONValue {
-        guard let socket else { throw GatewayError(message: "Not connected") }
+        guard let socket else { throw GatewayError(message: "Not connected", code: "OFFLINE") }
+        // Fail fast while offline. Without this, every poller queues 30s
+        // timeouts against a dead socket and they all pile up on reconnect.
+        if !state.isConnected, method != "connect" {
+            throw GatewayError(message: "Gateway offline", code: "OFFLINE")
+        }
         let id = UUID().uuidString
         // NOTE: no blanket idempotencyKey injection — several methods
         // (cron.add among them) have strict schemas that reject unknown
@@ -154,18 +162,21 @@ final class GatewayClient: ObservableObject {
         }
 
         // Per-RPC timeout (30s, matches the reference client).
+        // `pending.removeValue` is the single point of ownership: whoever
+        // removes the continuation resumes it. Resuming twice is a fatal
+        // error in Swift, so nothing else may touch it.
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 30_000_000_000)
-            self?.pending.removeValue(forKey: id)?
-                .resume(throwing: GatewayError(message: "\(method) timed out after 30s"))
+            guard let cont = self?.pending.removeValue(forKey: id) else { return }
+            cont.resume(throwing: GatewayError(message: "\(method) timed out after 30s"))
         }
         return try await withCheckedThrowingContinuation { cont in
             pending[id] = cont
             socket.send(.string(data)) { [weak self] error in
-                if let error {
-                    Task { @MainActor in
-                        self?.pending.removeValue(forKey: id)?.resume(throwing: error)
-                    }
+                guard let error else { return }
+                Task { @MainActor in
+                    guard let pendingCont = self?.pending.removeValue(forKey: id) else { return }
+                    pendingCont.resume(throwing: error)
                 }
             }
         }
@@ -322,7 +333,20 @@ final class GatewayClient: ObservableObject {
         failAllPending(error.localizedDescription)
         guard wantConnected else { state = .disconnected; return }
         state = .disconnected
-        lastError = error.localizedDescription
+        // Network-level drops (VPN toggling, sleep, Wi-Fi switch) are routine —
+        // report them plainly rather than as an error the user must act on.
+        let nsError = error as NSError
+        let transient = [NSURLErrorNetworkConnectionLost,
+                         NSURLErrorNotConnectedToInternet,
+                         NSURLErrorTimedOut,
+                         NSURLErrorCannotConnectToHost,
+                         NSURLErrorDNSLookupFailed,
+                         57, 54].contains(nsError.code)
+        lastError = transient
+            ? "Connection lost — reconnecting…"
+            : error.localizedDescription
+        events.send(GatewayEvent(name: "athena.disconnected",
+                                 payload: .from(["transient": transient])))
         reconnectAttempt += 1
         // Exponential backoff: 1s … 30s (matches the reference client).
         let delay = min(30.0, pow(2.0, Double(min(reconnectAttempt, 5))))

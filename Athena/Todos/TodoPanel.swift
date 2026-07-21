@@ -35,7 +35,7 @@ struct TodoPanel: View {
                 .background(Theme.bg.opacity(0.6))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                // Owner switch
+                // Owner switch — short labels so they never wrap.
                 HStack(spacing: 4) {
                     ForEach(TodoItem.Owner.allCases, id: \.self) { owner in
                         Button {
@@ -43,16 +43,19 @@ struct TodoPanel: View {
                         } label: {
                             HStack(spacing: 4) {
                                 Image(systemName: owner.icon).font(.system(size: 8))
-                                Text(owner == .me ? "For me" : "Delegate to Athena")
+                                Text(owner == .me ? "Me" : "Athena")
                                     .font(Theme.mono(9))
+                                    .fixedSize()
                             }
-                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
                             .background(draftOwner == owner
                                         ? owner.tint.opacity(0.18) : Theme.panelAlt)
                             .clipShape(Capsule())
                             .foregroundStyle(draftOwner == owner ? owner.tint : Theme.textFaint)
                         }
                         .buttonStyle(.plain)
+                        .help(owner == .me ? "Keep this task for yourself"
+                                           : "Delegate to Athena — it starts immediately")
                     }
                     Spacer()
                 }
@@ -180,61 +183,78 @@ private struct TodoRow: View {
             .buttonStyle(.plain)
             .padding(.top, 1)
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 5) {
                 Text(item.title)
-                    .font(Theme.mono(11))
+                    .font(Theme.mono(11.5))
                     .foregroundStyle(item.done ? Theme.textFaint : Theme.text)
                     .strikethrough(item.done, color: Theme.textFaint)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
                     .animation(.easeOut(duration: 0.2), value: item.done)
 
                 if !item.done {
-                    HStack(spacing: 5) {
-                        // Owner chip
-                        HStack(spacing: 3) {
-                            Image(systemName: item.owner.icon).font(.system(size: 7))
-                            Text(item.owner.label).font(Theme.mono(8))
-                        }
-                        .padding(.horizontal, 5).padding(.vertical, 2)
-                        .background(item.owner.tint.opacity(0.15))
-                        .clipShape(Capsule())
-                        .foregroundStyle(item.owner.tint)
+                    // Compact icon strip — no wrapping text chips.
+                    HStack(spacing: 9) {
+                        Image(systemName: item.owner.icon)
+                            .font(.system(size: 9))
+                            .foregroundStyle(item.owner.tint)
+                            .help(item.owner == .me ? "Yours" : "Delegated to Athena")
 
                         if item.owner == .athena {
-                            if running {
-                                ProgressView().controlSize(.small).scaleEffect(0.45)
-                                    .frame(width: 8, height: 8)
-                            } else {
-                                Circle().fill(item.status.tint).frame(width: 4, height: 4)
+                            HStack(spacing: 3) {
+                                if running {
+                                    ProgressView().controlSize(.small).scaleEffect(0.4)
+                                        .frame(width: 9, height: 9)
+                                } else {
+                                    Image(systemName: item.status.icon)
+                                        .font(.system(size: 9))
+                                }
+                                Text(item.status.shortLabel)
+                                    .font(Theme.mono(8.5))
+                                    .fixedSize()
                             }
-                            Text(item.status.label)
-                                .font(Theme.mono(8)).foregroundStyle(item.status.tint)
+                            .foregroundStyle(item.status.tint)
                         }
 
                         if !item.openQuestions.isEmpty {
                             HStack(spacing: 2) {
                                 Image(systemName: "questionmark.circle.fill")
-                                    .font(.system(size: 8))
-                                Text("\(item.openQuestions.count)").font(Theme.mono(8))
+                                    .font(.system(size: 9))
+                                Text("\(item.openQuestions.count)")
+                                    .font(Theme.mono(8.5))
                             }
                             .foregroundStyle(Theme.red)
+                            .help("\(item.openQuestions.count) question(s) waiting")
                         }
+
+                        if item.hasResult {
+                            Image(systemName: "doc.text.fill")
+                                .font(.system(size: 9))
+                                .foregroundStyle(Theme.green)
+                                .help("Result ready — click to read")
+                        }
+
                         Spacer(minLength: 0)
+
+                        if let percent = item.percent, percent > 0, percent < 100 {
+                            Text("\(percent)%")
+                                .font(Theme.mono(8.5)).foregroundStyle(Theme.textFaint)
+                        }
                     }
 
-                    // Progress bar for delegated work
-                    if let percent = item.percent, percent > 0 {
+                    // Slim progress bar, only while in flight.
+                    if let percent = item.percent, percent > 0, percent < 100 {
                         GeometryReader { geo in
                             ZStack(alignment: .leading) {
-                                Capsule().fill(Theme.border).frame(height: 3)
+                                Capsule().fill(Theme.border).frame(height: 2)
                                 Capsule().fill(Theme.amber)
                                     .frame(width: geo.size.width * CGFloat(percent) / 100,
-                                           height: 3)
+                                           height: 2)
                                     .animation(.easeOut(duration: 0.5), value: percent)
                             }
                         }
-                        .frame(height: 3)
+                        .frame(height: 2)
                     }
                 }
             }

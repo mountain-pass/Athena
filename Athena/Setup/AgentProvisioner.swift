@@ -19,8 +19,12 @@ final class AgentProvisioner: ObservableObject {
 
     /// Bump when the operating manual's contract changes — a mismatch triggers
     /// a re-provision on the next handshake.
-    static let contractVersion = 3   // v3: shared todo list
-    static let manifestPath = "athena/manifest.json"
+    static let contractVersion = 5   // v5: session-based todo protocol
+    /// Stored locally, per gateway URL.
+    static var manifestKey: String {
+        let url = UserDefaults.standard.string(forKey: "gateway.url") ?? "default"
+        return "agent.manifest.\(url)"
+    }
 
     enum HandshakeResult: Equatable {
         case alreadyProvisioned(version: Int)
@@ -50,8 +54,10 @@ final class AgentProvisioner: ObservableObject {
     /// messaging stays lean (no per-message instructions).
     @discardableResult
     func verifyOrProvision(news: NewsStore, todos: TodoStore? = nil) async -> HandshakeResult {
-        // Does the workspace carry our manifest?
-        let raw = await files.read(Self.manifestPath)
+        // The manifest lives locally: this gateway only permits bootstrap
+        // files in its workspace, so there's nowhere remote to keep it.
+        // Keyed per gateway so switching machines re-provisions correctly.
+        let raw = UserDefaults.standard.string(forKey: Self.manifestKey)
 
         if let raw,
            let data = raw.data(using: .utf8),
@@ -107,10 +113,8 @@ final class AgentProvisioner: ObservableObject {
             client: "athena-macos")
         guard let data = try? JSONEncoder().encode(manifest),
               let json = String(data: data, encoding: .utf8) else { return }
-        let method = await files.write(Self.manifestPath, content: json)
-        note(method == .unavailable
-             ? "  ✗ manifest: could not write"
-             : "  ✓ wrote contract manifest (v\(Self.contractVersion))")
+        UserDefaults.standard.set(json, forKey: Self.manifestKey)
+        note("  ✓ recorded contract v\(Self.contractVersion)")
     }
 
     // MARK: Entry point
@@ -173,31 +177,11 @@ final class AgentProvisioner: ObservableObject {
     // knows the protocol is live — not just described in the manual.
 
     private func seedTodoFiles(todos: TodoStore?) async {
-        // Canonical list (app-owned). Push current items, or an empty array.
-        let json: String
-        if let todos,
-           let data = try? JSONEncoder.iso.encode(todos.items),
-           let text = String(data: data, encoding: .utf8) {
-            json = text
-        } else {
-            json = "[]"
-        }
-        let listMethod = await files.write(TodoStore.todosPath, content: json)
-        note(listMethod == .unavailable
-             ? "  ✗ \(TodoStore.todosPath): could not write"
-             : "  ✓ seeded shared todo list (\(todos?.items.count ?? 0) items)")
-
-        // Append-only log (agent-owned). Create it empty if absent so the
-        // agent never has to wonder whether it exists.
-        if await files.read(TodoStore.logPath) == nil {
-            let header = """
-                {"type":"status","todoId":"__init__","status":"open","text":"log created by Athena"}
-                """
-            _ = await files.write(TodoStore.logPath, content: header + "\n")
-            note("  ✓ created todo update log")
-        } else {
-            note("  ✓ todo update log present")
-        }
+        // This gateway restricts agents.files.* to bootstrap files, so we no
+        // longer try to plant todos.json / todo-log.jsonl. The app holds the
+        // canonical list and briefs the agent per task in its own session.
+        let count = todos?.items.filter { $0.owner == .athena && !$0.done }.count ?? 0
+        note("✓ todo protocol documented (\(count) task(s) currently delegated)")
     }
 
     // MARK: Jobs
@@ -328,35 +312,34 @@ final class AgentProvisioner: ObservableObject {
 
         ## Shared todo list
 
-        The user and you share a task list. Athena owns `athena/todos.json` —
-        **read it, never write it.** You report by *appending* one JSON object
-        per line to `athena/todo-log.jsonl` (create it if missing).
+        The user and you share a task list. **Athena keeps the canonical list
+        in the app** — you don't need to read or write it. Each task you're
+        given arrives as a `[todo-assign]` message in its own session, and you
+        report back in that same session using the marker lines below.
 
-        ### The file you read
+        (If you also keep your own notes on disk with your file tools, that's
+        fine and useful for your memory — but Athena doesn't depend on it.)
 
-        `athena/todos.json` is an array of tasks:
+        ### The task session — and the RESULT block
 
-        ```json
-        {
-          "id": "8B1F…", "title": "Book flights to Tokyo",
-          "notes": "Late March, direct if possible",
-          "owner": "athena",          // "me" = the user's own task — ignore those
-          "status": "working",         // open | working | waitingOnUser | readyForReview
-          "done": false, "percent": 40
-        }
+        Each delegated task also gets its own session (`athena-todo-<id>`).
+        When Athena messages you there, reply with marker lines it parses:
+
+        ```
+        PROGRESS: Pulled the last 4 quarters of filings [40%]
+        QUESTION: Do you want this in AUD or USD?
+        STATUS: working
+        RESULT:
+        <the actual answer — numbers, summary, draft, whatever was asked for>
         ```
 
-        Only act on tasks where `"owner": "athena"` and `"done": false`.
+        **The RESULT block is the point of the task.** Progress notes describe
+        what you did; RESULT is what the user receives. A task that ends with
+        only progress notes has failed the user even if the work was done.
+        It runs to the end of the message, may span many lines, and may use
+        markdown, tables or code blocks — Athena renders it properly.
 
-        ### How you report back
-
-        Append single-line JSON to `athena/todo-log.jsonl`:
-
-        ```json
-        {"type":"progress","todoId":"8B1F…","text":"Checked 3 airlines, ANA is cheapest","percent":40}
-        {"type":"question","todoId":"8B1F…","text":"Window or aisle seat?"}
-        {"type":"status","todoId":"8B1F…","status":"readyForReview"}
-        ```
+        Finish with `STATUS: readyForReview`. Never mark a task complete.
 
         - **progress** — what you did, in one plain sentence. Include `percent`
           when you can estimate it. Log as you go, not just at the end.
@@ -386,12 +369,11 @@ final class AgentProvisioner: ObservableObject {
         Collection jobs should never message the user — they exist so that the
         archive is warm whenever the user asks something.
 
-        ## Contract manifest
+        ## Contract version
 
-        `\(Self.manifestPath)` records which version of this contract you were
-        set up with. Athena checks it once at connection time; if it matches, the
-        app sends no setup instructions at all and messages stay lean. Leave that
-        file alone — Athena maintains it.
+        Athena records which version of this contract you were set up with and
+        checks it once at connection time. If it matches, the app sends no setup
+        instructions at all and messages stay lean.
 
         ## Tone
 

@@ -69,6 +69,58 @@ final class CosyVoiceEngine: ObservableObject {
     /// Non-nil after a failure so the UI can offer a retry.
     @Published private(set) var lastFailure: String?
 
+    /// Reference clip for zero-shot cloning. CosyVoice has no built-in voice
+    /// catalogue — you pick a voice by giving it a few seconds of audio.
+    @Published var voiceSamplePath: String = UserDefaults.standard
+        .string(forKey: "tts.cosyVoiceSample") ?? "" {
+        didSet { UserDefaults.standard.set(voiceSamplePath, forKey: "tts.cosyVoiceSample") }
+    }
+    @Published var voiceSampleLabel: String = UserDefaults.standard
+        .string(forKey: "tts.cosyVoiceLabel") ?? "" {
+        didSet { UserDefaults.standard.set(voiceSampleLabel, forKey: "tts.cosyVoiceLabel") }
+    }
+    @Published private(set) var buildingReference = false
+
+    var voiceSampleURL: URL? {
+        voiceSamplePath.isEmpty ? nil : URL(fileURLWithPath: voiceSamplePath)
+    }
+
+    /// Where generated reference clips live.
+    static var referenceDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                            in: .userDomainMask)[0]
+        return base.appendingPathComponent("Athena/VoiceRefs", isDirectory: true)
+    }
+
+    /// Borrows a Kokoro voice as a CosyVoice reference: synthesize a sample
+    /// with Kokoro, then clone it. This is how soniqo's own docs demo cloning,
+    /// and it gives CosyVoice a usable voice picker.
+    func buildReference(fromKokoroVoice voiceID: String, label: String,
+                        using kokoro: KokoroEngine) async {
+        buildingReference = true
+        defer { buildingReference = false }
+        do {
+            let sampleText = """
+                The quick brown fox jumps over the lazy dog. \
+                I can help you with your schedule, your news, and anything else you need today.
+                """
+            let wav = try await kokoro.synthesize(text: sampleText, voice: voiceID)
+            try FileManager.default.createDirectory(at: Self.referenceDirectory,
+                                                    withIntermediateDirectories: true)
+            let url = Self.referenceDirectory.appendingPathComponent("\(voiceID).wav")
+            try wav.write(to: url)
+            voiceSamplePath = url.path
+            voiceSampleLabel = label
+        } catch {
+            lastFailure = "Could not build reference: \(error.localizedDescription)"
+        }
+    }
+
+    func clearReference() {
+        voiceSamplePath = ""
+        voiceSampleLabel = ""
+    }
+
     /// The 8 built-in emotion tags. The agent can emit these inline and
     /// CosyVoice will act on them; unknown tags pass through as freeform
     /// instructions, e.g. "(Speak like a pirate)".
@@ -132,12 +184,15 @@ final class CosyVoiceEngine: ObservableObject {
         await prepare(variant: variant)
     }
 
-    /// Synthesizes 24kHz WAV. `text` may contain inline emotion tags.
+    /// Synthesizes 24kHz WAV. `text` may contain inline emotion tags, and the
+    /// reference clip (if set) determines the voice.
     func synthesize(text: String, variant: Variant, instruction: String?) async throws -> Data {
         #if canImport(CosyVoiceTTS)
         if await !runner.isLoaded { await prepare(variant: variant) }
         guard case .ready = status else { throw TTSError.notReady }
-        return try await runner.synthesizeWAV(text: text, instruction: instruction)
+        return try await runner.synthesizeWAV(text: text,
+                                              instruction: instruction,
+                                              voiceSample: voiceSampleURL)
         #else
         throw TTSError.notAvailable
         #endif
@@ -161,14 +216,17 @@ final class CosyVoiceEngine: ObservableObject {
 
 /// All package-specific calls live here, off the main thread.
 ///
-/// API per soniqo.audio/api — `CosyVoiceTTSModel` conforms to
-/// `SpeechGenerationModel`:
-///     static func fromPretrained(modelId:cacheDir:offlineMode:progressHandler:)
-///     func generate(text:language:) async throws -> [Float]
-///     var sampleRate: Int
+/// Voice cloning (per soniqo.audio/guides/voice-cloning) is a two-step flow:
+///   1. `CamPlusPlusSpeaker.embed(audio:sampleRate:)` → 192-dim embedding
+///   2. `model.synthesize(text:instruction:speakerEmbedding:)`
+/// The embedding is cached per reference clip — extracting it runs a CoreML
+/// pass on the Neural Engine and shouldn't repeat for every sentence chunk.
 actor CosyVoiceRunner {
     #if canImport(CosyVoiceTTS)
     private var model: CosyVoiceTTSModel?
+    private var speaker: CamPlusPlusSpeaker?
+    private var cachedEmbedding: [Float]?
+    private var cachedSamplePath: String?
     #endif
 
     var isLoaded: Bool {
@@ -179,7 +237,6 @@ actor CosyVoiceRunner {
         #endif
     }
 
-    /// `progress` receives (fraction 0…1, human-readable detail).
     func load(modelID: String,
               progress: @escaping @Sendable (Double, String) -> Void) async throws {
         #if canImport(CosyVoiceTTS)
@@ -193,26 +250,92 @@ actor CosyVoiceRunner {
     func unload() {
         #if canImport(CosyVoiceTTS)
         model = nil
+        speaker = nil
+        cachedEmbedding = nil
+        cachedSamplePath = nil
         #endif
     }
 
-    /// Emotion tags stay inline in `text` — CosyVoice reads the prefix before
-    /// `<|endofprompt|>` as a style instruction. A global `instruction` is
-    /// prepended when the caller supplies one and the text has no tag.
-    func synthesizeWAV(text: String, instruction: String?) async throws -> Data {
+    /// Extracts (and caches) the speaker embedding for a reference clip.
+    private func embedding(for url: URL) async throws -> [Float]? {
+        #if canImport(CosyVoiceTTS)
+        if cachedSamplePath == url.path, let cachedEmbedding { return cachedEmbedding }
+
+        if speaker == nil {
+            // ~14 MB CoreML model, downloaded on first use.
+            speaker = try await CamPlusPlusSpeaker.fromPretrained()
+        }
+        guard let speaker,
+              let (samples, sampleRate) = AudioSampleLoader.load(url: url) else { return nil }
+
+        let embedding = try speaker.embed(audio: samples, sampleRate: sampleRate)
+        cachedEmbedding = embedding
+        cachedSamplePath = url.path
+        return embedding
+        #else
+        return nil
+        #endif
+    }
+
+    /// Emotion tags stay inline in `text`; `instruction` is the global style.
+    func synthesizeWAV(text: String, instruction: String?,
+                       voiceSample: URL? = nil) async throws -> Data {
         #if canImport(CosyVoiceTTS)
         guard let model else { throw CosyVoiceEngine.TTSError.notReady }
 
+        // Cloned voice path.
+        if let voiceSample, FileManager.default.fileExists(atPath: voiceSample.path),
+           let embedding = try? await embedding(for: voiceSample) {
+            let samples: [Float]
+            if let instruction, !instruction.isEmpty {
+                samples = model.synthesize(text: text,
+                                           instruction: instruction,
+                                           speakerEmbedding: embedding)
+            } else {
+                samples = model.synthesize(text: text, speakerEmbedding: embedding)
+            }
+            return KokoroEngine.wavData(from: samples, sampleRate: model.sampleRate)
+        }
+
+        // Default voice — instruction rides inline as a leading tag.
         var prompt = text
         if let instruction, !instruction.isEmpty,
            !text.trimmingCharacters(in: .whitespaces).hasPrefix("(") {
             prompt = "(\(instruction)) \(text)"
         }
-
         let samples = try await model.generate(text: prompt, language: "english")
         return KokoroEngine.wavData(from: samples, sampleRate: model.sampleRate)
         #else
         throw CosyVoiceEngine.TTSError.notAvailable
         #endif
+    }
+}
+
+/// Decodes an audio file into mono Float samples for the speaker encoder.
+enum AudioSampleLoader {
+    static func load(url: URL) -> (samples: [Float], sampleRate: Int)? {
+        guard let file = try? AVAudioFile(forReading: url) else { return nil }
+        let format = file.processingFormat
+        let frames = AVAudioFrameCount(file.length)
+        guard frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
+              (try? file.read(into: buffer)) != nil,
+              let channelData = buffer.floatChannelData else { return nil }
+
+        let count = Int(buffer.frameLength)
+        let channels = Int(format.channelCount)
+        var mono = [Float](repeating: 0, count: count)
+
+        if channels == 1 {
+            mono = Array(UnsafeBufferPointer(start: channelData[0], count: count))
+        } else {
+            // Downmix — the encoder expects a single speaker channel.
+            for frame in 0..<count {
+                var sum: Float = 0
+                for channel in 0..<channels { sum += channelData[channel][frame] }
+                mono[frame] = sum / Float(channels)
+            }
+        }
+        return (mono, Int(format.sampleRate))
     }
 }

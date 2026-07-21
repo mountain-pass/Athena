@@ -20,7 +20,11 @@ final class TodoStore: ObservableObject {
     private let gateway: GatewayClient
     private lazy var files = WorkspaceFiles(gateway: gateway)
     private var pollTimer: Timer?
+    /// Set when a save happened while offline.
+    private var pendingPush = false
     private var consumedLogLines = 0
+    /// Cleared once we learn the gateway can't serve the log file.
+    private var logFileUsable = true
 
     /// Visible ordering: needs-attention first, then agent work, then the rest.
     var sorted: [TodoItem] {
@@ -155,12 +159,18 @@ final class TodoStore: ObservableObject {
               PROGRESS: <one short sentence about what you just did> [45%]
               QUESTION: <ask only if genuinely blocked>
               STATUS: working | waitingOnUser | readyForReview
+              RESULT:
+              <the actual answer / deliverable — as long as it needs to be>
 
             Rules:
             - Start now. Use your tools. Report PROGRESS as you go, not only at the end.
-            - Never say the task is complete — finish with STATUS: readyForReview and let the user decide.
-            - If you need something from the user, emit QUESTION and STATUS: waitingOnUser.
-            - Keep every line short; they render in a narrow panel.
+            - **You MUST finish with a RESULT: block.** That is the thing the user
+              actually asked for — the numbers, the answer, the summary, the draft.
+              Progress notes are not a substitute for it.
+            - RESULT: goes last, may span many lines, and may use markdown.
+            - Then emit STATUS: readyForReview. Never claim completion — the user decides.
+            - If blocked, emit QUESTION and STATUS: waitingOnUser instead.
+            - Keep PROGRESS lines short; they render in a narrow panel.
             """
         markWorking(item.id)
         dispatch(sessionKey: Self.sessionKey(for: item), message: message,
@@ -201,12 +211,17 @@ final class TodoStore: ObservableObject {
 
     /// Nudges a task that's stalled or needs a push.
     /// Nudges a stalled task. Runs in the background — close the sheet freely.
-    func nudge(_ item: TodoItem) {
+    func nudge(_ item: TodoItem, instruction: String? = nil) {
         markWorking(item.id)
+        let ask = instruction ?? """
+            Continue, then finish with a RESULT: block containing the actual \
+            answer — not just progress notes.
+            """
         dispatch(sessionKey: Self.sessionKey(for: item),
                  message: """
-                    [todo-nudge] Continue task \(item.id) ("\(item.title)").
-                    Report with PROGRESS: / QUESTION: / STATUS: lines as before.
+                    [todo-nudge] Task \(item.id) ("\(item.title)").
+                    \(ask)
+                    Report with PROGRESS: / QUESTION: / STATUS: / RESULT: lines.
                     """,
                  todoId: item.id)
     }
@@ -223,8 +238,22 @@ final class TodoStore: ObservableObject {
 
     func stopSync() { pollTimer?.invalidate(); pollTimer = nil }
 
-    /// Writes the canonical list to the agent workspace.
+    /// Called when the gateway comes back — flush anything we deferred.
+    func resumeAfterReconnect() {
+        if pendingPush { pushToAgent() }
+        Task { await pullAgentUpdates() }
+    }
+
+    /// Best-effort mirror to the agent workspace. This gateway restricts
+    /// `agents.files.*` to bootstrap files, so it usually no-ops — the app is
+    /// the source of truth and the agent learns each task from its own
+    /// session brief. Nothing depends on this succeeding.
     func pushToAgent() {
+        guard gateway.state.isConnected else {
+            pendingPush = true          // flush once we're back
+            return
+        }
+        pendingPush = false
         let snapshot = items
         Task {
             guard let data = try? JSONEncoder.iso.encode(snapshot),
@@ -237,6 +266,7 @@ final class TodoStore: ObservableObject {
     ///  1. each task's own session transcript (always available), and
     ///  2. the append-only JSONL log (when the gateway allows file writes).
     func pullAgentUpdates() async {
+        guard gateway.state.isConnected else { return }   // stand down while offline
         guard !syncing else { return }
         syncing = true
         defer { syncing = false }
@@ -281,8 +311,37 @@ final class TodoStore: ObservableObject {
     private func apply(reply: String, to todoId: String) {
         guard let index = items.firstIndex(where: { $0.id == todoId }) else { return }
         var touched = false
+        var body = reply
 
-        for rawLine in reply.split(separator: "\n") {
+        // RESULT: is multi-line and runs to the end (or to the next marker).
+        if let resultRange = body.range(of: "RESULT:", options: [.caseInsensitive]) {
+            let after = String(body[resultRange.upperBound...])
+            var resultLines: [String] = []
+            var remainder: [String] = []
+            var stillResult = true
+            for line in after.split(separator: "\n", omittingEmptySubsequences: false) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                let isMarker = ["PROGRESS:", "QUESTION:", "STATUS:"].contains {
+                    trimmed.uppercased().hasPrefix($0)
+                }
+                if isMarker { stillResult = false }
+                stillResult ? resultLines.append(String(line)) : remainder.append(String(line))
+            }
+            let text = resultLines.joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty, items[index].result != text {
+                items[index].result = text
+                items[index].resultAt = .now
+                if items[index].status != .waitingOnUser {
+                    items[index].status = .readyForReview
+                    items[index].percent = 100
+                }
+                touched = true
+            }
+            body = String(body[..<resultRange.lowerBound]) + "\n" + remainder.joined(separator: "\n")
+        }
+
+        for rawLine in body.split(separator: "\n") {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
 
             if let body = value(of: "PROGRESS", in: line) {
@@ -294,7 +353,7 @@ final class TodoStore: ObservableObject {
                     text = body.replacingCharacters(in: match, with: "")
                         .trimmingCharacters(in: .whitespaces)
                 }
-                guard !text.isEmpty,
+                guard text.count > 3,
                       !items[index].progress.contains(where: { $0.text == text }) else { continue }
                 items[index].progress.append(ProgressNote(text: text, percent: percent))
                 if let percent { items[index].percent = percent }
@@ -319,15 +378,26 @@ final class TodoStore: ObservableObject {
             }
         }
 
-        // A reply with no markers at all still counts as a sign of life.
+        // No markers at all: keep the substance rather than dropping it.
         if !touched {
-            let summary = reply.split(separator: "\n").first.map(String.init) ?? reply
-            let trimmed = String(summary.prefix(160))
-            if !trimmed.isEmpty,
-               !items[index].progress.contains(where: { $0.text == trimmed }) {
-                items[index].progress.append(ProgressNote(text: trimmed))
-                if items[index].status == .open { items[index].status = .working }
-                touched = true
+            let clean = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Skip fragments like a stray "{" from a tool dump.
+            guard clean.count > 12 else { return }
+
+            if clean.count > 220 {
+                // A long unmarked reply is almost certainly the answer.
+                if items[index].result != clean {
+                    items[index].result = clean
+                    items[index].resultAt = .now
+                    touched = true
+                }
+            } else {
+                let line = String(clean.prefix(160))
+                if !items[index].progress.contains(where: { $0.text == line }) {
+                    items[index].progress.append(ProgressNote(text: line))
+                    if items[index].status == .open { items[index].status = .working }
+                    touched = true
+                }
             }
         }
 
@@ -346,8 +416,14 @@ final class TodoStore: ObservableObject {
 
     // MARK: Channel 2 — the JSONL log file
 
+    /// Optional second channel. Silent when the gateway can't expose files —
+    /// the session transcript above is the reliable path.
     private func pullFromLogFile() async {
-        guard let raw = await files.read(Self.logPath) else { return }
+        guard logFileUsable else { return }
+        guard let raw = await files.read(Self.logPath) else {
+            logFileUsable = false      // stop asking
+            return
+        }
 
         let lines = raw.split(separator: "\n").map(String.init)
         guard lines.count > consumedLogLines else { return }

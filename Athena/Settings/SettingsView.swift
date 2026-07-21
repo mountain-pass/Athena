@@ -248,6 +248,8 @@ private struct VoiceSettingsTab: View {
                 .labelsHidden()
             }
 
+            CosyVoicePicker(voice: voice)
+
             SettingsRow("Default style (optional)") {
                 TextField("e.g. You are a warm, concise assistant.",
                           text: $voice.cosyInstruction)
@@ -381,6 +383,121 @@ private struct AgentSettingsTab: View {
             .padding(20)
             .frame(width: 640, height: 560)
             .background(Theme.bg)
+        }
+    }
+}
+
+/// CosyVoice has no built-in voice catalogue — you pick a voice by giving it
+/// a reference clip to clone. Two routes: borrow a Kokoro voice, or import
+/// your own recording.
+struct CosyVoicePicker: View {
+    @ObservedObject var voice: VoiceManager
+    @State private var showImporter = false
+    @State private var showRecorder = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(text: "Voice (cloned from a reference clip)")
+
+            HStack(spacing: 8) {
+                Image(systemName: voice.cosyVoice.voiceSamplePath.isEmpty
+                      ? "person.wave.2" : "person.wave.2.fill")
+                    .foregroundStyle(voice.cosyVoice.voiceSamplePath.isEmpty
+                                     ? Theme.textFaint : Theme.green)
+                Text(voice.cosyVoice.voiceSamplePath.isEmpty
+                     ? "Default CosyVoice voice"
+                     : (voice.cosyVoice.voiceSampleLabel.isEmpty
+                        ? (voice.cosyVoice.voiceSampleURL?.lastPathComponent ?? "Custom clip")
+                        : voice.cosyVoice.voiceSampleLabel))
+                    .font(Theme.mono(11)).foregroundStyle(Theme.text)
+                if voice.cosyVoice.buildingReference {
+                    ProgressView().controlSize(.small).scaleEffect(0.6)
+                }
+                Spacer()
+                if !voice.cosyVoice.voiceSamplePath.isEmpty {
+                    Button("Reset") { voice.cosyVoice.clearReference() }
+                        .font(Theme.mono(10)).foregroundStyle(Theme.red)
+                        .buttonStyle(.plain)
+                }
+            }
+            .padding(9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.panel)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            // Borrow a Kokoro voice as the reference.
+            Text("Use a Kokoro voice as the reference")
+                .font(Theme.mono(9)).foregroundStyle(Theme.textFaint)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(KokoroEngine.voices, id: \.id) { candidate in
+                        Button {
+                            Task {
+                                await voice.cosyVoice.buildReference(
+                                    fromKokoroVoice: candidate.id,
+                                    label: candidate.label,
+                                    using: voice.kokoro)
+                            }
+                        } label: {
+                            Text(candidate.label.components(separatedBy: " (").first
+                                 ?? candidate.id)
+                                .font(Theme.mono(10))
+                                .padding(.horizontal, 9).padding(.vertical, 4)
+                                .background(voice.cosyVoice.voiceSampleLabel == candidate.label
+                                            ? Theme.green.opacity(0.18) : Theme.panelAlt)
+                                .clipShape(Capsule())
+                                .foregroundStyle(voice.cosyVoice.voiceSampleLabel == candidate.label
+                                                 ? Theme.green : Theme.textDim)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(voice.cosyVoice.buildingReference)
+                    }
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    showRecorder = true
+                } label: {
+                    Label("RECORD MY VOICE", systemImage: "mic.fill")
+                        .font(Theme.label).kerning(1)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Theme.amber).clipShape(Capsule())
+                        .foregroundStyle(.black)
+                }
+                .buttonStyle(.plain)
+
+                Button("Import a clip…") { showImporter = true }
+                    .font(Theme.mono(10))
+                Button("Reveal clips") {
+                    NSWorkspace.shared.selectFile(
+                        nil, inFileViewerRootedAtPath: CosyVoiceEngine.referenceDirectory.path)
+                }
+                .font(Theme.mono(10))
+            }
+
+            Text("CosyVoice ships one default voice — everything else is zero-shot cloning from a short reference clip (5–15 seconds, clean audio, one speaker). Borrowing a Kokoro voice requires the Kokoro model to be downloaded; it synthesizes a sample, then CosyVoice clones it.")
+                .font(Theme.mono(10)).foregroundStyle(Theme.textDim)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: [.audio, .wav, .mp3],
+                      allowsMultipleSelection: false) { result in
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            guard url.startAccessingSecurityScopedResource() else { return }
+            defer { url.stopAccessingSecurityScopedResource() }
+            // Copy into our own directory so the path stays valid.
+            try? FileManager.default.createDirectory(
+                at: CosyVoiceEngine.referenceDirectory, withIntermediateDirectories: true)
+            let destination = CosyVoiceEngine.referenceDirectory
+                .appendingPathComponent(url.lastPathComponent)
+            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.copyItem(at: url, to: destination)
+            voice.cosyVoice.voiceSamplePath = destination.path
+            voice.cosyVoice.voiceSampleLabel = url.deletingPathExtension().lastPathComponent
+        }
+        .sheet(isPresented: $showRecorder) {
+            RecordVoiceSampleSheet(voice: voice)
         }
     }
 }
