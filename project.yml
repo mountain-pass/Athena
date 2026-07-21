@@ -1,0 +1,67 @@
+name: Athena
+options:
+  bundleIdPrefix: com.athena
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  # kokoro-swift bundles Misaki as a LOCAL path package, which SPM refuses to
+  # resolve through a remote branch/revision dependency. So we vendor it:
+  #     ./Scripts/fetch-kokoro.sh     (clones into Vendor/kokoro-swift)
+  # If Vendor/kokoro-swift is absent, comment out this block and the matching
+  # dependency below — the app builds fine without it (System/Server voices).
+  kokoro-swift:
+    path: Vendor/kokoro-swift
+
+targets:
+  Athena:
+    type: application
+    platform: macOS
+    dependencies:
+      - package: kokoro-swift
+        product: Kokoro
+    sources:
+      - path: Athena
+    settings:
+      base:
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: 5.9
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Athena/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Athena/Resources/Athena.entitlements
+    info:
+      path: Athena/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Athena
+        CFBundleName: Athena
+        LSMinimumSystemVersion: "14.0"
+        NSMicrophoneUsageDescription: "Athena uses the microphone for push-to-talk voice commands."
+        NSSpeechRecognitionUsageDescription: "Athena transcribes your voice on-device to send commands to your agent."
+        NSAppleEventsUsageDescription: "Athena can open Terminal to install OpenClaw."
+        NSHighResolutionCapable: true
+        # Allow plaintext ws:// to the gateway. Tailscale traffic is already
+        # WireGuard-encrypted end-to-end, so ATS's TLS requirement is redundant.
+        # NOTE: a bare "ts.net" exception does NOT work — ts.net is on the
+        # Public Suffix List and ATS ignores public-suffix exceptions. We pin
+        # the specific tailnet domain instead (update if your tailnet changes),
+        # and keep ArbitraryLoads as the catch-all for 100.x IPs / LAN IPs.
+        # (Do not add NSAllowsLocalNetworking here — its presence makes the
+        # system ignore NSAllowsArbitraryLoads, which must stay effective.)
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSExceptionDomains:
+            tailf5cd1d.ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true
+    entitlements:
+      path: Athena/Resources/Athena.entitlements
+      properties:
+        # Sandbox is OFF: the app can optionally install/manage a local OpenClaw
+        # gateway (runs shell commands). Personal-use / Developer ID distribution.
+        com.apple.security.app-sandbox: false
+        com.apple.security.network.client: true
+        com.apple.security.device.audio-input: true
