@@ -120,8 +120,17 @@ struct VoiceHUD: View {
             Text(message).font(Theme.mono(11)).foregroundStyle(Theme.text)
                 .frame(maxWidth: 420, alignment: .leading)
             Button { voice.lastError = nil } label: {
-                Image(systemName: "xmark").font(.system(size: 9)).foregroundStyle(Theme.textDim)
-            }.buttonStyle(.plain)
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 17))
+                    .foregroundStyle(Theme.textDim)
+                    // The glyph alone was a ~9pt target. Padding plus an
+                    // explicit contentShape gives a comfortable hit area
+                    // without making the icon look oversized.
+                    .padding(6)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
         .background(Theme.panel.opacity(0.97))

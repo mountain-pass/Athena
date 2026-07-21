@@ -173,7 +173,9 @@ final class VoiceManager: NSObject, ObservableObject {
     }
     @Published private(set) var listeningSince: Date?
     @Published private(set) var level: Float = 0          // 0…1, animation driver
-    @Published var voiceReplies = true                    // TTS on voice-initiated turns
+    /// TTS on voice-initiated turns. Persisted like every other voice setting —
+    /// this one was being reset to `true` on every launch.
+    @Published var voiceReplies = true { didSet { persistTTS() } }
     @Published private(set) var permissionDenied = false
     /// Surfaced in the UI when audio can't start.
     @Published var lastError: String?
@@ -268,6 +270,12 @@ final class VoiceManager: NSObject, ObservableObject {
         installSpaceBarMonitor()
         loadTTS()
         loadSTT()
+        // Explicitly warm on launch. Relying on the `engine` didSet isn't
+        // enough: it's guarded by `oldValue != engine`, so a saved engine that
+        // matches the default never fires it and the model stayed cold until
+        // the first reply. Both warmers are no-ops unless the weights are
+        // already on disk — neither will start a download.
+        warmCurrentEngine()
         // Keep the picker honest if the runtime rejects a variant.
         cosyVoice.onVariantFallback = { [weak self] variant in
             Task { @MainActor in
@@ -284,9 +292,10 @@ final class VoiceManager: NSObject, ObservableObject {
            let e = STTEngine(rawValue: raw) {
             sttEngine = e
         }
-        // Download/load in the background so the first dictation isn't a
-        // multi-minute wait. Non-blocking — the UI stays responsive and the
-        // Settings pane shows progress.
+        NSLog("[voice] restored settings — STT: %@, TTS: %@, spoken replies: %@",
+              sttEngine.rawValue, engine.rawValue, voiceReplies ? "on" : "off")
+        // Loads the model into memory if it's already on disk, so the first
+        // dictation isn't a cold start. Never downloads — see warmUp().
         if sttEngine == .parakeet { parakeet.warmUp() }
     }
 
@@ -303,6 +312,9 @@ final class VoiceManager: NSObject, ObservableObject {
             cosyVariant = CosyVoiceEngine.Variant(rawValue: raw) ?? .eightBit
         }
         cosyInstruction = d.string(forKey: "tts.cosyInstruction") ?? ""
+        // `object(forKey:)` rather than `bool(forKey:)` — the latter returns
+        // false for a missing key, which would silently flip the default.
+        voiceReplies = d.object(forKey: "tts.voiceReplies") as? Bool ?? true
     }
     private func persistTTS() {
         let d = UserDefaults.standard
@@ -314,6 +326,7 @@ final class VoiceManager: NSObject, ObservableObject {
         d.set(kokoroVoice, forKey: "tts.kokoroVoice")
         d.set(cosyVariant.rawValue, forKey: "tts.cosyVariant")
         d.set(cosyInstruction, forKey: "tts.cosyInstruction")
+        d.set(voiceReplies, forKey: "tts.voiceReplies")
     }
 
     // MARK: Permissions
