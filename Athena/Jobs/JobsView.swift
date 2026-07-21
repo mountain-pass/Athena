@@ -81,7 +81,8 @@ private struct JobRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(job.name).font(Theme.mono(13, weight: .semibold)).foregroundStyle(Theme.text)
                 HStack(spacing: 8) {
-                    Label(job.scheduleExpr, systemImage: "clock")
+                    // Plain English, with the cron kept as a quiet detail.
+                    Label(Schedule.from(cron: job.scheduleExpr).summary, systemImage: "clock")
                         .font(Theme.mono(10)).foregroundStyle(Theme.amber)
                     Text(job.prompt).font(Theme.mono(10)).foregroundStyle(Theme.textFaint)
                         .lineLimit(1)
@@ -104,64 +105,3 @@ private struct JobRow: View {
     }
 }
 
-private struct JobEditor: View {
-    let job: ScheduledJob?
-    let onSave: (String, String, String) -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    @State private var name = ""
-    @State private var expr = "0 7 * * *"
-    @State private var prompt = ""
-
-    private static let presets: [(String, String)] = [
-        ("Every morning 7am", "0 7 * * *"),
-        ("Weekdays 9am", "0 9 * * 1-5"),
-        ("Every hour", "0 * * * *"),
-        ("Sunday 6pm", "0 18 * * 0"),
-    ]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(job == nil ? "New Scheduled Job" : "Edit Job")
-                .font(Theme.title).foregroundStyle(Theme.text)
-
-            SectionLabel(text: "Name")
-            TextField("e.g. Weekly portfolio summary", text: $name)
-                .textFieldStyle(.roundedBorder).font(Theme.body)
-
-            SectionLabel(text: "Schedule (cron)")
-            HStack {
-                TextField("0 7 * * *", text: $expr)
-                    .textFieldStyle(.roundedBorder).font(Theme.mono(12)).frame(width: 140)
-                Picker("Preset", selection: $expr) {
-                    Text("Custom").tag(expr)
-                    ForEach(Self.presets, id: \.1) { p in Text(p.0).tag(p.1) }
-                }
-                .frame(width: 200)
-            }
-
-            SectionLabel(text: "What should the agent do?")
-            TextEditor(text: $prompt)
-                .font(Theme.body).frame(height: 120)
-                .scrollContentBackground(.hidden)
-                .padding(6).background(Theme.panel)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            HStack {
-                Button("Cancel") { dismiss() }
-                Spacer()
-                Button(job == nil ? "Create" : "Save") {
-                    onSave(name, expr, prompt); dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(name.isEmpty || prompt.isEmpty)
-            }
-        }
-        .padding(20)
-        .frame(width: 480)
-        .background(Theme.bg)
-        .onAppear {
-            if let job { name = job.name; expr = job.scheduleExpr; prompt = job.prompt }
-        }
-    }
-}

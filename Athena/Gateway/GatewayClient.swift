@@ -134,18 +134,25 @@ final class GatewayClient: ObservableObject {
     func request(_ method: String, _ params: JSONValue = .object([:])) async throws -> JSONValue {
         guard let socket else { throw GatewayError(message: "Not connected") }
         let id = UUID().uuidString
-        var frame: [String: JSONValue] = [
+        // NOTE: no blanket idempotencyKey injection — several methods
+        // (cron.add among them) have strict schemas that reject unknown
+        // properties. Methods that support it (chat.send) set it explicitly.
+        let frame: [String: JSONValue] = [
             "type": .string("req"),
             "id": .string(id),
             "method": .string(method),
             "params": params,
         ]
-        // Side-effecting methods require idempotency keys.
-        if case .object(var p) = params, p["idempotencyKey"] == nil, methodIsSideEffecting(method) {
-            p["idempotencyKey"] = .string(UUID().uuidString)
-            frame["params"] = .object(p)
+        // Serialize off-main: encoding a frame carrying a base64 attachment
+        // is expensive and must not block the UI.
+        let frameValue = JSONValue.object(frame)
+        let data: String
+        if method == "chat.send" {
+            data = await Task.detached(priority: .userInitiated) { frameValue.jsonString }.value
+        } else {
+            data = frameValue.jsonString
         }
-        let data = JSONValue.object(frame).jsonString
+
         // Per-RPC timeout (30s, matches the reference client).
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 30_000_000_000)
@@ -164,11 +171,6 @@ final class GatewayClient: ObservableObject {
         }
     }
 
-    private func methodIsSideEffecting(_ method: String) -> Bool {
-        !(method == "connect" // strict handshake schema — no extra fields
-          || method.hasSuffix(".list") || method.hasSuffix(".get") || method.hasSuffix(".status")
-          || method == "health" || method == "status" || method.hasSuffix(".history"))
-    }
 
     // MARK: Receive loop
 

@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import SwiftUI
 
 struct NewsTopic: Identifiable, Codable, Equatable {
     var id: String { name }
@@ -27,10 +28,21 @@ final class NewsStore: ObservableObject {
     @Published private(set) var items: [NewsItem] = []
     @Published private(set) var fetching = false
     @Published private(set) var lastFetched: Date?
+    /// Count from the most recent archive write — drives the "+N archived" badge.
+    @Published var newlyArchived = 0
+    @Published private(set) var backgroundCollection = false
+
+    /// Fired after each successful fetch (carousel auto-topics listen here).
+    var onItemsUpdated: (([NewsItem]) -> Void)?
+
+    private lazy var archiver = NewsArchiver(gateway: gateway)
+    private var autoRefreshTimer: Timer?
 
     static let cronJobName = "athena-daily-news-brief"
 
     private let gateway: GatewayClient
+    /// Exposed for helpers that ride the same connection (SourceSuggester).
+    var gatewayRef: GatewayClient { gateway }
 
     static let defaultTopics: [NewsTopic] = [
         NewsTopic(name: "Finance", enabled: true, sources: [
@@ -95,14 +107,40 @@ final class NewsStore: ObservableObject {
         items.filter { $0.topic == topic }
     }
 
+    /// Fetches feeds entirely off the main thread and swaps results in with a
+    /// gentle animation. Safe to call from anywhere — never blocks the UI.
     func fetchLatest(force: Bool = false) {
         if fetching { return }
         if !force, let last = lastFetched, Date().timeIntervalSince(last) < 600 { return }
         fetching = true
+
         let targets = enabledTopics.flatMap { topic in
             topic.sources.compactMap { src in URL(string: src).map { (topic.name, $0) } }
         }
+
         Task {
+            // Network + XML parsing + dedupe all happen off-main.
+            let fresh = await Self.collect(targets: targets)
+
+            withAnimation(.easeInOut(duration: 0.35)) {
+                self.items = fresh
+            }
+            self.lastFetched = .now
+            self.fetching = false
+
+            // Persist to the agent's memory so it can summarize later
+            // without re-fetching.
+            let added = await self.archiver.archive(fresh)
+            if added > 0 { self.newlyArchived = added }
+            self.onItemsUpdated?(fresh)
+        }
+    }
+
+    /// Pure background work — no actor isolation, so it can't stall the UI.
+    nonisolated private static func collect(
+        targets: [(String, URL)]
+    ) async -> [NewsItem] {
+        await Task.detached(priority: .userInitiated) { () -> [NewsItem] in
             var collected: [NewsItem] = []
             await withTaskGroup(of: [NewsItem].self) { group in
                 for (topicName, url) in targets {
@@ -110,29 +148,111 @@ final class NewsStore: ObservableObject {
                         var req = URLRequest(url: url)
                         req.timeoutInterval = 12
                         req.setValue("Athena/0.1 (RSS reader)", forHTTPHeaderField: "User-Agent")
-                        guard let (data, _) = try? await URLSession.shared.data(for: req) else { return [] }
+                        guard let (data, _) = try? await URLSession.shared.data(for: req)
+                        else { return [] }
                         return RSSParser().parse(data: data, topic: topicName, sourceURL: url)
                     }
                 }
                 for await batch in group { collected.append(contentsOf: batch) }
             }
-            // Dedupe by normalized title, newest first, cap per topic.
+
+            // Dedupe by normalized title, newest first, capped per topic.
             var seen = Set<String>()
             let sorted = collected.sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
             var deduped: [NewsItem] = []
             var perTopic: [String: Int] = [:]
             for item in sorted {
-                let key = item.title.lowercased().prefix(60)
-                guard !seen.contains(String(key)) else { continue }
+                let key = String(item.title.lowercased().prefix(60))
+                guard !seen.contains(key) else { continue }
                 guard (perTopic[item.topic] ?? 0) < 25 else { continue }
-                seen.insert(String(key))
+                seen.insert(key)
                 perTopic[item.topic, default: 0] += 1
                 deduped.append(item)
             }
-            self.items = deduped
-            self.lastFetched = .now
-            self.fetching = false
+            return deduped
+        }.value
+    }
+
+    /// Pulls stories the agent archived (including while this Mac was asleep)
+    /// straight out of its workspace memory, and merges them with live items.
+    func loadFromAgentMemory(daysBack: Int = 2) async {
+        let archived = await archiver.loadArchive(daysBack: daysBack)
+        guard !archived.isEmpty else { return }
+
+        let merged = await Self.merge(live: items, archived: archived)
+        withAnimation(.easeInOut(duration: 0.35)) {
+            self.items = merged
         }
+        if lastFetched == nil { lastFetched = .now }
+    }
+
+    nonisolated private static func merge(live: [NewsItem],
+                                          archived: [NewsItem]) async -> [NewsItem] {
+        await Task.detached(priority: .utility) {
+            var seen = Set<String>()
+            var out: [NewsItem] = []
+            // Live items win (they carry summaries); archive fills the gaps.
+            for item in (live + archived).sorted(by: {
+                ($0.date ?? .distantPast) > ($1.date ?? .distantPast)
+            }) {
+                let key = String(item.title.lowercased().prefix(60))
+                guard !seen.contains(key) else { continue }
+                seen.insert(key)
+                out.append(item)
+            }
+            return out
+        }.value
+    }
+
+    // MARK: Background refresh while the app is open
+
+    func startAutoRefresh(every minutes: Double = 15) {
+        autoRefreshTimer?.invalidate()
+        autoRefreshTimer = Timer.scheduledTimer(withTimeInterval: minutes * 60,
+                                                repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.fetchLatest(force: true) }
+        }
+    }
+
+    func stopAutoRefresh() {
+        autoRefreshTimer?.invalidate()
+        autoRefreshTimer = nil
+    }
+
+    // MARK: 24/7 collection on the gateway (runs while this Mac sleeps)
+
+    static let collectionJobName = "athena-news-collector"
+
+    func enableBackgroundCollection(hourly: Bool) {
+        Task {
+            do {
+                let jobs = try await gateway.cronList()
+                let existing = jobs.first { $0["name"]?.stringValue == Self.collectionJobName }
+                if hourly {
+                    let prompt = NewsArchiver.backgroundCollectionPrompt(topics: topics)
+                    if let existing, let id = existing["id"]?.stringValue {
+                        _ = try await gateway.cronUpdate(id: id, patch: GatewayClient.cronPatch(
+                            schedule: "0 * * * *", prompt: prompt, enabled: true))
+                    } else {
+                        _ = try await gateway.cronAdd(name: Self.collectionJobName,
+                                                      schedule: "0 * * * *",
+                                                      prompt: prompt)
+                    }
+                    syncStatus = "✓ Gateway collects news hourly into its memory"
+                } else if let existing, let id = existing["id"]?.stringValue {
+                    try await gateway.cronRemove(id: id)
+                    syncStatus = "Background collection disabled"
+                }
+                backgroundCollection = hourly
+            } catch {
+                syncStatus = "✗ \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Asks the agent to summarize from its stored archive (cheap — no fetching).
+    func summarizeSinceLastTalk(chat: ChatStore) {
+        chat.send(text: NewsArchiver.sinceLastTalkPrompt())
     }
 
     // MARK: Gateway sync
@@ -168,11 +288,10 @@ final class NewsStore: ObservableObject {
                 let existing = jobs.first { $0["name"]?.stringValue == Self.cronJobName }
                 let schedule = "0 \(briefHour) * * *"
                 if let existing, let id = existing["id"]?.stringValue {
-                    _ = try await gateway.cronUpdate(id: id, patch: .from([
-                        "schedule": ["kind": "cron", "expr": schedule],
-                        "payload": ["kind": "agentTurn", "message": briefPrompt],
-                        "enabled": topics.contains(where: \.enabled),
-                    ]))
+                    _ = try await gateway.cronUpdate(id: id, patch: GatewayClient.cronPatch(
+                        schedule: schedule,
+                        prompt: briefPrompt,
+                        enabled: topics.contains(where: \.enabled)))
                 } else {
                     _ = try await gateway.cronAdd(name: Self.cronJobName,
                                                   schedule: schedule,

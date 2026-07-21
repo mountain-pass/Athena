@@ -44,19 +44,72 @@ enum WorldMap {
         [0...71], [0...71], [0...71], [0...71], [0...71],      // Antarctica
     ]
 
-    /// Flattened (lat, lon) land points, computed once.
+    /// Is a given 5° cell land?
+    static func isLand(row: Int, col: Int) -> Bool {
+        guard rows.indices.contains(row) else { return false }
+        let c = ((col % colCount) + colCount) % colCount
+        return rows[row].contains { $0.contains(c) }
+    }
+
+    /// True when the generated high-resolution mask is present
+    /// (run `python3 Scripts/make-coastline.py`).
+    static let hasDetailedMask: Bool = {
+        #if canImport(Foundation)
+        return !LandMaskData.bits.isEmpty
+        #else
+        return false
+        #endif
+    }()
+
+    /// Real coastlines from Natural Earth, when the generated mask exists.
+    static let detailedPoints: [(lat: Double, lon: Double)] = {
+        guard hasDetailedMask else { return [] }
+        var points: [(Double, Double)] = []
+        let step = LandMaskData.degrees
+        for row in 0..<LandMaskData.rows {
+            let lat = 90 - (Double(row) + 0.5) * step
+            // Thin longitudes toward the poles so dot density stays even.
+            let cosLat = max(0.10, cos(lat * .pi / 180))
+            let stride = max(1, Int((1.0 / cosLat).rounded()))
+            for col in Swift.stride(from: 0, to: LandMaskData.columns, by: stride)
+            where LandMaskData.isLand(row: row, col: col) {
+                points.append((lat, -180 + (Double(col) + 0.5) * step))
+            }
+        }
+        return points
+    }()
+
+    /// Coarse fallback: (lat, lon) land points at ~2.5° resolution.
+    ///
+    /// The source mask is 5°; we subdivide each land cell into up to 4 points,
+    /// emitting the in-between ones only when the neighbouring cell is also
+    /// land. That quadruples density without fattening coastlines.
     static let landPoints: [(lat: Double, lon: Double)] = {
         var points: [(Double, Double)] = []
-        for (i, ranges) in rows.enumerated() {
+        let half = step / 2
+
+        for (i, _) in rows.enumerated() {
             let lat = latTop - Double(i) * step
-            // Thin out dots near the poles so density looks even on the sphere.
-            let stride = max(1, Int(1.0 / max(0.18, cos(lat * .pi / 180))))
-            var used = Set<Int>()
-            for range in ranges {
-                for j in range where j % stride == 0 {
-                    guard !used.contains(j) else { continue }
-                    used.insert(j)
-                    points.append((lat, -180 + Double(j) * step))
+            // Longitudes converge at the poles — thin out so density looks even.
+            let cosLat = max(0.12, cos(lat * .pi / 180))
+            let lonStride = max(1, Int((1.0 / cosLat).rounded()))
+
+            for j in 0..<colCount where isLand(row: i, col: j) {
+                guard j % lonStride == 0 else { continue }
+                let lon = -180 + Double(j) * step
+                points.append((lat, lon))
+
+                // Interpolated companions (only into neighbouring land).
+                let eastIsLand = isLand(row: i, col: j + 1)
+                let southIsLand = isLand(row: i + 1, col: j)
+                if eastIsLand, lonStride == 1 {
+                    points.append((lat, lon + half))
+                }
+                if southIsLand {
+                    points.append((lat - half, lon))
+                    if eastIsLand, isLand(row: i + 1, col: j + 1), lonStride == 1 {
+                        points.append((lat - half, lon + half))
+                    }
                 }
             }
         }
@@ -97,19 +150,79 @@ private func project(lat: Double, lon: Double, rotation: Double,
 
 // MARK: - Globe view
 
+/// Tracks rotation: auto-spin, drag override, inertia, and idle resume.
+///
+/// Deliberately NOT an ObservableObject: it's mutated every frame from inside
+/// the TimelineView body, and publishing during a view update is illegal
+/// ("Publishing changes from within view updates is not allowed" → crash).
+/// TimelineView already redraws each frame, so no observation is needed.
+@MainActor
+final class GlobeSpin {
+    var rotation: Double = 0        // degrees
+    var isDragging = false
+
+    private var velocity: Double = 0           // deg/sec from a flick
+    private var lastFrame: Date = .now
+    private var idleSince: Date = .now
+    private var dragStartRotation: Double = 0
+
+    let autoSpeed: Double = 4.0                // deg/sec
+    private let resumeDelay: TimeInterval = 3  // seconds of stillness
+
+    /// Advances and returns the rotation — safe to call during a view update.
+    func rotationAdvanced(to now: Date) -> Double {
+        advance(to: now)
+        return rotation
+    }
+
+    private func advance(to now: Date) {
+        let dt = min(0.1, now.timeIntervalSince(lastFrame))
+        lastFrame = now
+        guard !isDragging else { return }
+
+        if abs(velocity) > 0.5 {
+            // Flick inertia, decaying.
+            rotation += velocity * dt
+            velocity *= pow(0.15, dt)          // ~85% damping per second
+            idleSince = now
+        } else if now.timeIntervalSince(idleSince) > resumeDelay {
+            // Ease back into the ambient spin.
+            let sinceResume = now.timeIntervalSince(idleSince) - resumeDelay
+            let ramp = min(1, sinceResume / 1.5)
+            rotation += autoSpeed * ramp * dt
+        }
+    }
+
+    func beginDrag() {
+        isDragging = true
+        velocity = 0
+        dragStartRotation = rotation
+    }
+
+    func drag(translation: CGFloat, width: CGFloat) {
+        // A full width drag ≈ 180° of rotation.
+        rotation = dragStartRotation + Double(translation / max(1, width)) * 180
+    }
+
+    func endDrag(predictedTranslation: CGFloat, translation: CGFloat, width: CGFloat) {
+        isDragging = false
+        idleSince = .now
+        let overshoot = Double((predictedTranslation - translation) / max(1, width)) * 180
+        velocity = max(-220, min(220, overshoot * 2.2))
+    }
+}
+
 struct WorldGlobeView: View {
     let hotspots: [GeoHotspot]
     @Binding var selected: GeoHotspot?
-    /// Degrees per second.
-    var spinSpeed: Double = 4.0
 
+    @State private var spin = GlobeSpin()
     private let tilt = 0.38   // ~22°, gives the Bailongma 3/4 view
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
             GeometryReader { geo in
-                let t = timeline.date.timeIntervalSinceReferenceDate
-                let rotation = t * spinSpeed
+                let rotation = spin.rotationAdvanced(to: timeline.date)
                 let size = min(geo.size.width, geo.size.height)
                 let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
                 let radius = size * 0.42
@@ -120,6 +233,23 @@ struct WorldGlobeView: View {
                         drawGraticule(ctx, center: center, radius: radius, rotation: rotation)
                         drawLand(ctx, center: center, radius: radius, rotation: rotation)
                     }
+                    // Drag anywhere on the globe to spin it; it resumes its
+                    // ambient rotation a few seconds after you let go.
+                    .contentShape(Circle())
+                    .gesture(
+                        DragGesture(minimumDistance: 2)
+                            .onChanged { value in
+                                if !spin.isDragging { spin.beginDrag() }
+                                spin.drag(translation: value.translation.width,
+                                          width: geo.size.width)
+                            }
+                            .onEnded { value in
+                                spin.endDrag(
+                                    predictedTranslation: value.predictedEndTranslation.width,
+                                    translation: value.translation.width,
+                                    width: geo.size.width)
+                            }
+                    )
 
                     // Hotspot targets (real SwiftUI views → hoverable/clickable)
                     ForEach(hotspots) { spot in
@@ -130,7 +260,7 @@ struct WorldGlobeView: View {
                             HotspotMarker(
                                 hotspot: spot,
                                 isSelected: selected?.id == spot.id,
-                                phase: t
+                                phase: timeline.date.timeIntervalSinceReferenceDate
                             ) {
                                 selected = (selected?.id == spot.id) ? nil : spot
                             }
@@ -194,8 +324,10 @@ struct WorldGlobeView: View {
 
     private func drawLand(_ ctx: GraphicsContext, center: CGPoint,
                           radius: CGFloat, rotation: Double) {
-        let dot = max(1.0, radius / 95)
-        for (lat, lon) in WorldMap.landPoints {
+        let detailed = WorldMap.hasDetailedMask
+        let points = detailed ? WorldMap.detailedPoints : WorldMap.landPoints
+        let dot = max(0.9, radius / (detailed ? 150 : 95))
+        for (lat, lon) in points {
             let p = project(lat: lat, lon: lon, rotation: rotation, tilt: tilt,
                             center: center, radius: radius)
             guard p.visible else { continue }

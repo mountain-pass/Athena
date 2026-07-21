@@ -62,12 +62,9 @@ final class JobsStore: ObservableObject {
     func update(_ job: ScheduledJob) {
         Task {
             do {
-                _ = try await gateway.cronUpdate(id: job.id, patch: .from([
-                    "name": job.name,
-                    "schedule": ["kind": "cron", "expr": job.scheduleExpr],
-                    "payload": ["kind": "agentTurn", "message": job.prompt],
-                    "enabled": job.enabled,
-                ]))
+                _ = try await gateway.cronUpdate(id: job.id, patch: GatewayClient.cronPatch(
+                    name: job.name, schedule: job.scheduleExpr,
+                    prompt: job.prompt, enabled: job.enabled))
                 refresh()
             } catch { errorMessage = error.localizedDescription }
         }

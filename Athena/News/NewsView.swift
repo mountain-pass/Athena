@@ -27,13 +27,19 @@ struct NewsView: View {
             }
         }
         .sheet(item: $selectedItem) { item in
-            NewsDetailView(item: item) { prompt in
+            NewsDetailView(item: item,
+                           onPin: { app.carousel.pin(item) }) { prompt in
                 app.chat.send(text: prompt)
                 selectedItem = nil
             }
         }
         .sheet(isPresented: $showConfig) { NewsConfigSheet(news: news) }
-        .task { news.fetchLatest() }
+        .task {
+            news.fetchLatest()
+            news.startAutoRefresh(every: 15)
+        }
+        .animation(.easeInOut(duration: 0.3), value: news.fetching)
+        .animation(.easeInOut(duration: 0.3), value: news.newlyArchived)
     }
 
     // MARK: Monitor (globe + topic columns)
@@ -49,6 +55,13 @@ struct NewsView: View {
         return VStack(spacing: 0) {
             header
             Divider().overlay(Theme.border)
+
+            // Widgets live inside the monitor pane — the chat dock keeps
+            // full window height alongside them.
+            if app.stocks.enabled {
+                StockTickerBar(stocks: app.stocks)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
 
             if columns.isEmpty {
                 emptyState("No topics enabled — open the gear above the chat to add some.")
@@ -77,8 +90,17 @@ struct NewsView: View {
                     .padding(12)
                 }
             }
+
+            if app.carousel.enabled {
+                CarouselBar(carousel: app.carousel) { prompt in
+                    app.chat.send(text: prompt)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
         .panel()
+        .animation(.easeInOut(duration: 0.25), value: app.stocks.enabled)
+        .animation(.easeInOut(duration: 0.25), value: app.carousel.enabled)
     }
 
     private var header: some View {
@@ -94,8 +116,17 @@ struct NewsView: View {
                     .font(Theme.mono(10)).foregroundStyle(Theme.textFaint)
                 Label("\(GeoTagger.hotspots(from: news.items).count) regions", systemImage: "mappin.and.ellipse")
                     .font(Theme.mono(10)).foregroundStyle(Theme.textFaint)
+                if news.newlyArchived > 0 {
+                    Label("+\(news.newlyArchived) archived", systemImage: "internaldrive")
+                        .font(Theme.mono(10)).foregroundStyle(Theme.green)
+                        .transition(.scale.combined(with: .opacity))
+                }
                 if news.fetching {
-                    ProgressView().controlSize(.small)
+                    HStack(spacing: 5) {
+                        ProgressView().controlSize(.small).scaleEffect(0.7)
+                        Text("fetching…").font(Theme.mono(10)).foregroundStyle(Theme.textFaint)
+                    }
+                    .transition(.opacity)
                 } else if let last = news.lastFetched {
                     Text("updated \(last, format: .dateTime.hour().minute())")
                         .font(Theme.mono(10)).foregroundStyle(Theme.textFaint)
@@ -158,6 +189,17 @@ struct NewsView: View {
                 SectionLabel(text: "Ask Athena", color: Theme.amber)
                 Spacer()
                 Button {
+                    news.summarizeSinceLastTalk(chat: app.chat)
+                } label: {
+                    Text("SINCE LAST TALK").font(Theme.label).kerning(1)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Theme.panelAlt).clipShape(Capsule())
+                        .foregroundStyle(Theme.amber)
+                }
+                .buttonStyle(.plain)
+                .help("Summarize from the agent's stored archive — no re-fetching")
+
+                Button {
                     news.runNow(chat: app.chat)
                 } label: {
                     Text("AI BRIEF").font(Theme.label).kerning(1)
@@ -166,7 +208,7 @@ struct NewsView: View {
                         .foregroundStyle(.black)
                 }
                 .buttonStyle(.plain)
-                .help("Ask the agent to summarize today's stories")
+                .help("Full brief — the agent fetches and summarizes fresh")
                 Button { showConfig = true } label: {
                     Image(systemName: "gearshape").foregroundStyle(Theme.textDim)
                 }
@@ -322,8 +364,10 @@ struct TopicColumn: View {
 
 struct NewsDetailView: View {
     let item: NewsItem
+    var onPin: (() -> Void)?
     let onAskAthena: (String) -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var pinned = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -367,6 +411,21 @@ struct NewsDetailView: View {
                             .foregroundStyle(Theme.text)
                     }.buttonStyle(.plain)
                 }
+                if let onPin {
+                    Button {
+                        onPin(); pinned = true
+                    } label: {
+                        Label(pinned ? "PINNED" : "PIN TO WATCHLIST",
+                              systemImage: pinned ? "checkmark" : "pin")
+                            .font(Theme.label).kerning(1)
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(pinned ? Theme.green.opacity(0.2) : Theme.panelAlt)
+                            .clipShape(Capsule())
+                            .foregroundStyle(pinned ? Theme.green : Theme.text)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(pinned)
+                }
                 Button {
                     let link = item.link?.absoluteString ?? ""
                     onAskAthena("Summarize this article and give me the key takeaways:\n\(item.title)\n\(link)")
@@ -386,145 +445,3 @@ struct NewsDetailView: View {
     }
 }
 
-// MARK: - Config sheet (gear)
-
-struct NewsConfigSheet: View {
-    @ObservedObject var news: NewsStore
-    @Environment(\.dismiss) private var dismiss
-    @State private var newTopicName = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("News Monitor Settings").font(Theme.title).foregroundStyle(Theme.text)
-                Spacer()
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark").foregroundStyle(Theme.textDim)
-                }.buttonStyle(.plain)
-            }
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    SectionLabel(text: "Topics")
-                    ForEach($news.topics) { $topic in
-                        EditableTopicCard(topic: $topic) { news.deleteTopic(topic) }
-                    }
-                    HStack {
-                        TextField("New topic name (e.g. Crypto, Gaming, Space)…", text: $newTopicName)
-                            .textFieldStyle(.plain).font(Theme.body).foregroundStyle(Theme.text)
-                            .padding(8).background(Theme.panel)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                            .onSubmit(addTopic)
-                        Button("ADD TOPIC") { addTopic() }
-                            .buttonStyle(.plain).font(Theme.label).kerning(1)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(Theme.amber).clipShape(Capsule())
-                            .foregroundStyle(.black)
-                    }
-
-                    Divider().overlay(Theme.border).padding(.vertical, 4)
-
-                    SectionLabel(text: "Daily AI Brief")
-                    HStack(spacing: 12) {
-                        Text("Deliver at").font(Theme.body).foregroundStyle(Theme.textDim)
-                        Picker("", selection: $news.briefHour) {
-                            ForEach(0..<24, id: \.self) { h in
-                                Text(String(format: "%02d:00", h)).tag(h)
-                            }
-                        }
-                        .labelsHidden().frame(width: 90)
-                        Toggle(isOn: $news.allowBrowsing) {
-                            Text("Allow web browsing fallback")
-                                .font(Theme.mono(11)).foregroundStyle(Theme.textDim)
-                        }.toggleStyle(.checkbox)
-                        Spacer()
-                    }
-                    HStack(spacing: 10) {
-                        Button { news.syncToGateway() } label: {
-                            Text("SAVE & SCHEDULE ON GATEWAY").font(Theme.label).kerning(1)
-                                .padding(.horizontal, 12).padding(.vertical, 8)
-                                .background(Theme.amber).clipShape(Capsule())
-                                .foregroundStyle(.black)
-                        }.buttonStyle(.plain)
-                        if let status = news.syncStatus {
-                            Text(status).font(Theme.mono(10))
-                                .foregroundStyle(status.hasPrefix("✓") ? Theme.green : Theme.textDim)
-                        }
-                        Spacer()
-                    }
-                }
-            }
-        }
-        .padding(20)
-        .frame(width: 620, height: 560)
-        .background(Theme.bg)
-        .onDisappear { news.fetchLatest(force: true) }
-    }
-
-    private func addTopic() {
-        news.addTopic(named: newTopicName)
-        newTopicName = ""
-    }
-}
-
-private struct EditableTopicCard: View {
-    @Binding var topic: NewsTopic
-    let onDelete: () -> Void
-    @State private var expanded = false
-    @State private var newSource = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Toggle("", isOn: $topic.enabled)
-                    .toggleStyle(.switch).tint(Theme.amber).labelsHidden()
-                Text(topic.name.uppercased())
-                    .font(Theme.mono(12, weight: .semibold)).kerning(1)
-                    .foregroundStyle(topic.enabled ? Theme.text : Theme.textFaint)
-                Spacer()
-                Text("\(topic.sources.count) sources")
-                    .font(Theme.mono(9)).foregroundStyle(Theme.textFaint)
-                Button { withAnimation { expanded.toggle() } } label: {
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .foregroundStyle(Theme.textDim)
-                }.buttonStyle(.plain)
-                Button { onDelete() } label: {
-                    Image(systemName: "trash").font(.system(size: 11))
-                        .foregroundStyle(Theme.red.opacity(0.8))
-                }.buttonStyle(.plain)
-            }
-            if expanded {
-                ForEach(topic.sources, id: \.self) { source in
-                    HStack {
-                        Image(systemName: "dot.radiowaves.up.forward")
-                            .font(.system(size: 9)).foregroundStyle(Theme.green)
-                        Text(source).font(Theme.mono(9)).foregroundStyle(Theme.textDim)
-                            .lineLimit(1).truncationMode(.middle)
-                        Spacer()
-                        Button { topic.sources.removeAll { $0 == source } } label: {
-                            Image(systemName: "xmark").font(.system(size: 8))
-                                .foregroundStyle(Theme.textFaint)
-                        }.buttonStyle(.plain)
-                    }
-                }
-                HStack {
-                    TextField("Add RSS/Atom feed URL…", text: $newSource)
-                        .textFieldStyle(.plain).font(Theme.mono(10)).foregroundStyle(Theme.text)
-                        .padding(6).background(Theme.bg)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                        .onSubmit(addSource)
-                    Button("Add") { addSource() }
-                        .buttonStyle(.plain).font(Theme.mono(10)).foregroundStyle(Theme.amber)
-                }
-            }
-        }
-        .padding(12)
-        .background(Theme.panelAlt)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-    }
-
-    private func addSource() {
-        let trimmed = newSource.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty { topic.sources.append(trimmed); newSource = "" }
-    }
-}

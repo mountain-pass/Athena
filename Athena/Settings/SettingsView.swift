@@ -10,8 +10,12 @@ struct SettingsView: View {
         TabView {
             ConnectionSettingsTab()
                 .tabItem { Label("Connection", systemImage: "antenna.radiowaves.left.and.right") }
-            VoiceSettingsTab(voice: voice)
+            VoiceSettingsTab(voice: voice, chat: app.chat)
                 .tabItem { Label("Voice", systemImage: "waveform") }
+            AgentSettingsTab()
+                .tabItem { Label("Agent", systemImage: "brain") }
+            WidgetSettingsTab(stocks: app.stocks, carousel: app.carousel, news: app.news)
+                .tabItem { Label("Widgets", systemImage: "square.grid.2x2") }
         }
         .frame(width: 620, height: 560)
         .background(Theme.bg)
@@ -78,12 +82,23 @@ private struct ConnectionSettingsTab: View {
 
 private struct VoiceSettingsTab: View {
     @ObservedObject var voice: VoiceManager
+    @ObservedObject var chat: ChatStore
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 Toggle("Speak replies to voice messages", isOn: $voice.voiceReplies)
                     .font(Theme.body)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Ask the agent to reply conversationally on voice turns",
+                           isOn: Binding(get: { chat.useVoiceDirective },
+                                         set: { chat.useVoiceDirective = $0 }))
+                        .font(Theme.body)
+                    Text("Sends a short hint with spoken messages so replies come back as plain speakable sentences instead of markdown with bullets and emoji. Athena also strips any leftover formatting before reading aloud.")
+                        .font(Theme.mono(10)).foregroundStyle(Theme.textDim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 SettingsRow("TTS engine") {
                     Picker("", selection: $voice.engine) {
@@ -96,6 +111,7 @@ private struct VoiceSettingsTab: View {
                     switch voice.engine {
                     case .system: systemSection
                     case .kokoro: kokoroSection
+                    case .cosyVoice: cosySection
                     case .server: serverSection
                     }
                 }
@@ -184,6 +200,16 @@ private struct VoiceSettingsTab: View {
                         Text("Downloads resume automatically and retry up to 5 times. If it keeps failing, fetch the two files manually — see README → Kokoro manual install.")
                             .font(Theme.mono(10)).foregroundStyle(Theme.textDim)
                             .fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            Task { await voice.kokoro.prepare() }
+                        } label: {
+                            Label("RETRY", systemImage: "arrow.clockwise")
+                                .font(Theme.label).kerning(1)
+                                .padding(.horizontal, 12).padding(.vertical, 6)
+                                .background(Theme.amber).clipShape(Capsule())
+                                .foregroundStyle(.black)
+                        }
+                        .buttonStyle(.plain)
                     }
                 case .notLoaded:
                     Text(voice.kokoro.status.label)
@@ -206,6 +232,41 @@ private struct VoiceSettingsTab: View {
             }
 
             helpText("Kokoro-82M runs fully on-device on Apple Silicon (M1+) — no server, no Docker, works offline. Weights download once from HuggingFace; voices fetch on demand. Falls back to the system voice if anything fails.")
+        }
+    }
+
+    // CosyVoice 3 — emotional, on-device
+
+    private var cosySection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            CosyStatusRow(cosy: voice.cosyVoice, variant: voice.cosyVariant)
+
+            SettingsRow("Model size") {
+                Picker("", selection: $voice.cosyVariant) {
+                    ForEach(CosyVoiceEngine.Variant.allCases) { v in Text(v.rawValue).tag(v) }
+                }
+                .labelsHidden()
+            }
+
+            SettingsRow("Default style (optional)") {
+                TextField("e.g. You are a warm, concise assistant.",
+                          text: $voice.cosyInstruction)
+                    .textFieldStyle(.roundedBorder).font(Theme.mono(11))
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                SectionLabel(text: "Emotion tags")
+                Text("CosyVoice acts on inline tags — the agent can write “(happy) Good news!” or “(whispers) between you and me…” and the delivery changes. Unknown tags work as freeform direction, e.g. “(Speak like a pirate)”.")
+                    .font(Theme.mono(10)).foregroundStyle(Theme.textDim)
+                    .fixedSize(horizontal: false, vertical: true)
+                FlowTags(tags: CosyVoiceEngine.emotions)
+                Button("Preview with emotion") {
+                    voice.speakNow("(excited) The markets just moved. (calm) But nothing needs your attention right now.")
+                }
+                .font(Theme.mono(11))
+            }
+
+            helpText("CosyVoice 3 (0.5B) runs on-device via MLX. Bigger and slower to start than Kokoro, but far more expressive and capable of voice cloning. Weights cache in ~/Library/Caches/qwen3-speech. Requires macOS 15+ and Apple Silicon.")
         }
     }
 
@@ -237,6 +298,181 @@ private struct VoiceSettingsTab: View {
         case .premium: "Premium"
         case .enhanced: "Enhanced"
         default: "Standard"
+        }
+    }
+}
+
+// MARK: - Agent provisioning
+
+private struct AgentSettingsTab: View {
+    @EnvironmentObject var app: AppState
+    @EnvironmentObject var gateway: GatewayClient
+    @State private var showManual = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Athena is only the interface — the agent does the work. Sync writes an operating manual into the agent's workspace (AGENTS.md + HEARTBEAT.md), seeds the shared todo files, and schedules its jobs — so it knows how to archive news, run delegated tasks, when to summarize from memory, and how to answer voice turns.")
+                    .font(Theme.mono(11)).foregroundStyle(Theme.textDim)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 12) {
+                    Button(app.provisioner.running ? "Syncing…" : "Sync agent configuration") {
+                        Task {
+                            await app.provisioner.provision(news: app.news, todos: app.todos)
+                            app.chat.agentProvisioned = true
+                        }
+                    }
+                    .disabled(app.provisioner.running || !gateway.state.isConnected)
+
+                    Button("Preview manual") { showManual = true }
+
+                    switch app.provisioner.handshake {
+                    case .alreadyProvisioned(let v):
+                        Label("contract v\(v) verified", systemImage: "checkmark.seal.fill")
+                            .font(Theme.mono(10)).foregroundStyle(Theme.green)
+                    case .provisioned(let reason):
+                        Label("provisioned (\(reason))", systemImage: "checkmark.seal.fill")
+                            .font(Theme.mono(10)).foregroundStyle(Theme.green)
+                    case .failed(let why):
+                        Label(why, systemImage: "exclamationmark.triangle")
+                            .font(Theme.mono(10)).foregroundStyle(Theme.red)
+                    case nil:
+                        EmptyView()
+                    }
+                }
+
+                if !app.provisioner.log.isEmpty {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(app.provisioner.log.enumerated()), id: \.offset) { _, line in
+                            Text(line).font(Theme.mono(10))
+                                .foregroundStyle(line.hasPrefix("✗") || line.contains("✗")
+                                                 ? Theme.red : Theme.textDim)
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Theme.panel)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+
+                Text("Re-run this after changing news topics, sources, or the brief time — the manual embeds them. Your own edits to AGENTS.md are preserved; only the fenced ATHENA section is replaced.")
+                    .font(Theme.mono(10)).foregroundStyle(Theme.textFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Spacer()
+            }
+            .padding(24)
+        }
+        .sheet(isPresented: $showManual) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Agent operating manual").font(Theme.title).foregroundStyle(Theme.text)
+                    Spacer()
+                    Button("Close") { showManual = false }
+                }
+                ScrollView {
+                    Text(app.provisioner.operatingManual(news: app.news))
+                        .font(Theme.mono(10))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(20)
+            .frame(width: 640, height: 560)
+            .background(Theme.bg)
+        }
+    }
+}
+
+/// Status + load/unload for the embedded CosyVoice model.
+struct CosyStatusRow: View {
+    @ObservedObject var cosy: CosyVoiceEngine
+    let variant: CosyVoiceEngine.Variant
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch cosy.status {
+            case .ready:
+                Label(cosy.status.label, systemImage: "checkmark.circle.fill")
+                    .font(Theme.mono(11)).foregroundStyle(Theme.green)
+
+            case .downloading(let fraction, _):
+                VStack(alignment: .leading, spacing: 5) {
+                    ProgressView(value: fraction)
+                        .frame(maxWidth: 340)
+                        .tint(Theme.amber)
+                    HStack(spacing: 8) {
+                        Text(cosy.status.label)
+                            .font(Theme.mono(10)).foregroundStyle(Theme.textDim)
+                        Text(variant.rawValue.components(separatedBy: " (").last?
+                            .replacingOccurrences(of: ")", with: "") ?? "")
+                            .font(Theme.mono(9)).foregroundStyle(Theme.textFaint)
+                    }
+                }
+
+            case .loading:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(cosy.status.label)
+                        .font(Theme.mono(11)).foregroundStyle(Theme.textDim)
+                }
+
+            case .unavailable(let why):
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(why, systemImage: "exclamationmark.triangle.fill")
+                        .font(Theme.mono(11)).foregroundStyle(Theme.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        Task { await cosy.retry(variant: variant) }
+                    } label: {
+                        Label("RETRY", systemImage: "arrow.clockwise")
+                            .font(Theme.label).kerning(1)
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(Theme.amber).clipShape(Capsule())
+                            .foregroundStyle(.black)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+            case .notLoaded:
+                Text(cosy.status.label)
+                    .font(Theme.mono(11)).foregroundStyle(Theme.textDim)
+            }
+
+            HStack(spacing: 12) {
+                Button(cosy.isDownloaded ? "Load model" : "Download & load model") {
+                    Task { await cosy.prepare(variant: variant) }
+                }
+                .disabled(cosy.status.isBusy)
+
+                if cosy.isDownloaded {
+                    Button("Unload") { cosy.unload() }.disabled(cosy.status.isBusy)
+                    Button("Reveal cache") {
+                        NSWorkspace.shared.selectFile(
+                            nil, inFileViewerRootedAtPath: CosyVoiceEngine.cacheDirectory.path)
+                    }
+                }
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: cosy.status)
+    }
+}
+
+/// Horizontal tag strip for the emotion list.
+struct FlowTags: View {
+    let tags: [String]
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(tags, id: \.self) { tag in
+                    Text("(\(tag))")
+                        .font(Theme.mono(10))
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(Theme.panelAlt).clipShape(Capsule())
+                        .foregroundStyle(Theme.amber)
+                }
+            }
         }
     }
 }

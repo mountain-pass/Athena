@@ -100,12 +100,38 @@ struct VoiceOrbPanel: View {
             ParticleSphereView(level: voice.level, accent: accent)
                 .frame(maxWidth: .infinity)
                 .aspectRatio(1, contentMode: .fit)
-            if !voice.liveTranscript.isEmpty {
+                .contentShape(Rectangle())
+                .onTapGesture { if voice.isSpeaking { voice.stopSpeaking() } }
+                .help(voice.isSpeaking ? "Click to stop speaking" : "")
+            if voice.state == .listening {
+                // Live transcript grows as you speak — recognition rotates
+                // segments underneath, so you can talk for as long as you like.
+                ScrollView {
+                    Text(voice.liveTranscript.isEmpty ? "Listening…" : voice.liveTranscript)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(voice.liveTranscript.isEmpty ? Theme.textFaint : Theme.text)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 90)
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    HStack(spacing: 6) {
+                        Circle().fill(Theme.red).frame(width: 5, height: 5)
+                        Text(timeLabel(voice.listeningElapsed))
+                            .font(Theme.mono(10)).foregroundStyle(Theme.textDim)
+                        Text("· release SPACE to send")
+                            .font(Theme.mono(9)).foregroundStyle(Theme.textFaint)
+                    }
+                }
+            } else if !voice.liveTranscript.isEmpty {
                 Text(voice.liveTranscript)
                     .font(Theme.mono(11))
                     .foregroundStyle(Theme.text)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .center)
+            } else if voice.isSpeaking {
+                Text("ESC or click to stop")
+                    .font(Theme.mono(11))
+                    .foregroundStyle(Theme.red)
             } else {
                 Text("Hold SPACE to talk")
                     .font(Theme.mono(11))
@@ -114,5 +140,10 @@ struct VoiceOrbPanel: View {
         }
         .padding(14)
         .panel()
+    }
+
+    private func timeLabel(_ seconds: TimeInterval) -> String {
+        let s = Int(seconds)
+        return String(format: "%d:%02d", s / 60, s % 60)
     }
 }

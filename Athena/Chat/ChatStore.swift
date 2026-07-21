@@ -1,20 +1,58 @@
 import Foundation
 import Combine
+import SwiftUI
 
 struct ChatMessage: Identifiable, Equatable {
     enum Role { case user, assistant, system }
-    let id: UUID
+    let id: String
     let role: Role
     var text: String
     var viaVoice = false
     var attachmentNames: [String] = []
     var streaming = false
     let date: Date
+    /// Raw tool/search payloads — collapsed in the UI and never spoken.
+    var isToolNoise = false
+    /// Reply to a spoken turn — rendered as a compact "Voice response" bubble
+    /// (expandable), with the full text going to TTS.
+    var isVoiceReply = false
 
-    init(id: UUID = UUID(), role: Role, text: String, viaVoice: Bool = false,
-         attachmentNames: [String] = [], streaming: Bool = false, date: Date = .now) {
+    init(id: String = UUID().uuidString, role: Role, text: String, viaVoice: Bool = false,
+         attachmentNames: [String] = [], streaming: Bool = false, date: Date = .now,
+         isToolNoise: Bool = false, isVoiceReply: Bool = false) {
         self.id = id; self.role = role; self.text = text; self.viaVoice = viaVoice
         self.attachmentNames = attachmentNames; self.streaming = streaming; self.date = date
+        self.isToolNoise = isToolNoise; self.isVoiceReply = isVoiceReply
+    }
+
+    var byteLabel: String {
+        ByteCountFormatter.string(fromByteCount: Int64(text.utf8.count), countStyle: .file)
+    }
+
+    /// Deterministic id for a history row.
+    ///
+    /// Critical for scroll stability: generating a fresh UUID on every history
+    /// refresh made SwiftUI treat every message as brand new, tearing down and
+    /// rebuilding the list several times a second — which is what made the
+    /// transcript bounce while the agent was working.
+    static func stableID(index: Int, text: String) -> String {
+        "h\(index)-\(text.hashValue)"
+    }
+
+    /// Detects machine payloads that shouldn't be read as conversation:
+    /// web-search dumps, JSON blobs, untrusted-content envelopes.
+    static func looksLikeToolNoise(_ text: String) -> Bool {
+        if text.contains("EXTERNAL_UNTRUSTED_CONTENT") { return true }
+        if text.contains("\"siteName\"") || text.contains("\"snippet\"") { return true }
+        if text.contains("<<<") && text.contains(">>>") { return true }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (trimmed.hasPrefix("{") || trimmed.hasPrefix("[")), trimmed.count > 400 { return true }
+        // Mostly-JSON heuristic for long blobs.
+        if trimmed.count > 1500 {
+            let quotes = trimmed.filter { $0 == "\"" }.count
+            if Double(quotes) / Double(trimmed.count) > 0.02 { return true }
+        }
+        return false
     }
 }
 
@@ -22,9 +60,42 @@ struct ChatMessage: Identifiable, Equatable {
 /// loads history on (re)connect, and triggers TTS for voice-initiated turns.
 @MainActor
 final class ChatStore: ObservableObject {
-    @Published private(set) var messages: [ChatMessage] = []
+    /// Full transcript. The UI renders only a window of this (see `messages`)
+    /// so a long history can't bog down or crash the view.
+    @Published private(set) var allMessages: [ChatMessage] = []
+    /// How many recent messages are currently rendered.
+    @Published private(set) var visibleCount = 20
+
+    /// The slice SwiftUI actually draws.
+    var messages: [ChatMessage] {
+        allMessages.suffix(visibleCount).map { $0 }
+    }
+    var hasOlderMessages: Bool { allMessages.count > visibleCount }
+
+    func loadOlder(step: Int = 20) {
+        guard hasOlderMessages, !loadingOlder else { return }
+        loadingOlder = true
+        // Deferred so this can never mutate state during a view update.
+        Task { @MainActor in
+            withAnimation(.easeOut(duration: 0.2)) {
+                visibleCount = min(visibleCount + step, allMessages.count)
+            }
+            loadingOlder = false
+        }
+    }
+    private var loadingOlder = false
+
+    /// Resets the window when the transcript is replaced wholesale.
+    private func clampVisibleCount() {
+        if visibleCount > allMessages.count {
+            visibleCount = max(20, allMessages.count)
+        }
+    }
+
     @Published private(set) var agentBusy = false
     @Published var pendingAttachments: [ChatAttachment] = []
+    /// Number of attachments currently being read/converted off-main.
+    @Published private(set) var attachmentsLoading = 0
 
     // Live generation stats (chars ≈ tokens × 4)
     @Published private(set) var turnCharCount = 0
@@ -44,6 +115,7 @@ final class ChatStore: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     /// True while the current agent turn was started by voice → speak the reply.
     private var currentTurnViaVoice = false
+    private var streamingSpeechStarted = false
     private var historyRefreshTask: Task<Void, Never>?
 
     init(gateway: GatewayClient, voice: VoiceManager) {
@@ -56,7 +128,42 @@ final class ChatStore: ObservableObject {
             .store(in: &cancellables)
     }
 
+    // MARK: Attachment loading (always off the main thread)
+
+    func beginAttachmentLoad() { attachmentsLoading += 1 }
+
+    func finishAttachmentLoad(_ attachment: ChatAttachment?) {
+        attachmentsLoading = max(0, attachmentsLoading - 1)
+        if let attachment {
+            pendingAttachments.append(attachment)
+        } else {
+            allMessages.append(ChatMessage(role: .system, text: "Could not read that attachment."))
+        }
+    }
+
     // MARK: Sending
+
+    /// Marker prepended to spoken turns. The full contract lives in the agent's
+    /// AGENTS.md (written by AgentProvisioner) — this just flags the mode, so
+    /// we don't burn tokens restating the rules on every message.
+    static let voiceMarker = "[voice]"
+
+    /// Used when the agent hasn't been provisioned yet: spells out the rules
+    /// inline so voice still sounds right on an unconfigured gateway.
+    static let voiceDirectiveFallback = """
+        [voice] (The user spoke this and will hear your reply via text-to-speech. \
+        Reply in plain speakable sentences — no markdown, headings, bullets, \
+        emoji, code or URLs. Keep it brief and natural.)
+        """
+
+    /// Set true once AgentProvisioner has written the manual to the workspace.
+    var agentProvisioned = UserDefaults.standard.bool(forKey: "agent.provisioned") {
+        didSet { UserDefaults.standard.set(agentProvisioned, forKey: "agent.provisioned") }
+    }
+
+    var useVoiceDirective = UserDefaults.standard.object(forKey: "voice.directive") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(useVoiceDirective, forKey: "voice.directive") }
+    }
 
     func send(text: String, viaVoice: Bool = false) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -67,14 +174,23 @@ final class ChatStore: ObservableObject {
         agentBusy = true
         turnCharCount = 0
         turnStarted = .now
-        messages.append(ChatMessage(role: .user, text: trimmed, viaVoice: viaVoice,
+        // The bubble shows only what the user said; the directive rides along
+        // to the agent invisibly.
+        allMessages.append(ChatMessage(role: .user, text: trimmed, viaVoice: viaVoice,
                                     attachmentNames: atts.map(\.fileName)))
+        let payload: String
+        if viaVoice && useVoiceDirective {
+            let prefix = agentProvisioned ? Self.voiceMarker : Self.voiceDirectiveFallback
+            payload = "\(prefix)\n\n\(trimmed)"
+        } else {
+            payload = trimmed
+        }
         Task {
             do {
-                _ = try await gateway.chatSend(trimmed, attachments: atts)
+                _ = try await gateway.chatSend(payload, attachments: atts)
             } catch {
                 self.agentBusy = false
-                self.messages.append(ChatMessage(role: .system, text: "Send failed: \(error.localizedDescription)"))
+                self.allMessages.append(ChatMessage(role: .system, text: "Send failed: \(error.localizedDescription)"))
             }
         }
     }
@@ -90,13 +206,15 @@ final class ChatStore: ObservableObject {
             guard let history = try? await gateway.chatHistory() else { return }
             let rows = history["messages"]?.arrayValue ?? history.arrayValue ?? []
             var loaded: [ChatMessage] = []
-            for row in rows {
+            for (index, row) in rows.enumerated() {
                 guard let text = Self.extractText(row), !text.isEmpty else { continue }
                 let roleStr = row["role"]?.stringValue ?? row["sender"]?.stringValue ?? "assistant"
                 let role: ChatMessage.Role = (roleStr == "user") ? .user : .assistant
-                loaded.append(ChatMessage(role: role, text: text))
+                loaded.append(ChatMessage(id: ChatMessage.stableID(index: index, text: text),
+                                          role: role, text: text,
+                                          isToolNoise: ChatMessage.looksLikeToolNoise(text)))
             }
-            if !loaded.isEmpty { self.messages = loaded }
+            if !loaded.isEmpty { self.allMessages = loaded }
         }
     }
 
@@ -125,7 +243,9 @@ final class ChatStore: ObservableObject {
     private func scheduleHistoryRefresh() {
         historyRefreshTask?.cancel()
         historyRefreshTask = Task {
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            // Short debounce — this is the main source of perceived latency
+            // when live event parsing misses the reply.
+            try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
             await refreshFromHistory()
         }
@@ -135,14 +255,34 @@ final class ChatStore: ObservableObject {
         guard let history = try? await gateway.chatHistory() else { return }
         let rows = history["messages"]?.arrayValue ?? history.arrayValue ?? []
         var loaded: [ChatMessage] = []
-        for row in rows {
+        for (index, row) in rows.enumerated() {
             guard let text = Self.extractText(row), !text.isEmpty else { continue }
             let roleStr = row["role"]?.stringValue ?? row["sender"]?.stringValue
                 ?? row["author"]?.stringValue ?? "assistant"
-            loaded.append(ChatMessage(role: roleStr == "user" ? .user : .assistant, text: text))
+            loaded.append(ChatMessage(id: ChatMessage.stableID(index: index, text: text),
+                                      role: roleStr == "user" ? .user : .assistant,
+                                      text: text,
+                                      isToolNoise: ChatMessage.looksLikeToolNoise(text)))
         }
-        guard !loaded.isEmpty, loaded.count >= messages.filter({ $0.role != .system }).count else { return }
-        messages = loaded
+        guard !loaded.isEmpty,
+              loaded.count >= allMessages.filter({ $0.role != .system }).count else { return }
+
+        // Only publish when something actually changed — otherwise SwiftUI
+        // rebuilds the list for nothing and the view jumps.
+        let sameCount = loaded.count == allMessages.count
+        let sameContent = sameCount && zip(loaded, allMessages).allSatisfy {
+            $0.id == $1.id && $0.text == $1.text
+        }
+        guard !sameContent else {
+            if agentBusy, let last = loaded.last, last.role == .assistant {
+                turnCharCount = max(turnCharCount, last.text.count)
+                finishTurn()
+            }
+            return
+        }
+
+        allMessages = loaded
+        clampVisibleCount()
         if agentBusy, let last = loaded.last, last.role == .assistant {
             turnCharCount = max(turnCharCount, last.text.count)
             finishTurn()
@@ -150,9 +290,17 @@ final class ChatStore: ObservableObject {
     }
 
     private func ingestAssistantUpdate(_ payload: JSONValue) {
+        // Only the main session belongs in this transcript — background
+        // sessions (source suggestions, config lookups) stay invisible.
+        if let sk = payload["sessionKey"]?.stringValue, sk != GatewayClient.mainSessionKey {
+            return   // config / todo side-sessions stay out of the transcript
+        }
         // Ignore echoes of our own user messages.
         let role = payload["role"]?.stringValue ?? payload["message"]?["role"]?.stringValue
         if role == "user" { return }
+        // Tool results belong in the Live Cognition panel, not the transcript.
+        if role == "tool" || payload["tool"] != nil || payload["toolName"] != nil
+            || payload["toolResult"] != nil { return }
         guard let text = Self.extractText(payload), !text.isEmpty else {
             // No text — could be a lifecycle marker (turn end).
             if payload["state"]?.stringValue == "final" || payload["done"]?.boolValue == true {
@@ -161,12 +309,21 @@ final class ChatStore: ObservableObject {
             return
         }
         if agentBusy { turnCharCount = max(turnCharCount, text.count) }
+        // Speak as the reply arrives, not after it finishes.
+        if currentTurnViaVoice {
+            if !streamingSpeechStarted {
+                streamingSpeechStarted = true
+                voice.beginStreamingSpeech()
+            }
+            voice.appendStreamingSpeech(fullTextSoFar: text)
+        }
         let isFinal = payload["state"]?.stringValue != "delta"
-        if let last = messages.last, last.role == .assistant, last.streaming {
-            messages[messages.count - 1].text = text
-            if isFinal { messages[messages.count - 1].streaming = false; finishTurn() }
+        if let last = allMessages.last, last.role == .assistant, last.streaming {
+            allMessages[allMessages.count - 1].text = text
+            if isFinal { allMessages[allMessages.count - 1].streaming = false; finishTurn() }
         } else {
-            messages.append(ChatMessage(role: .assistant, text: text, streaming: !isFinal))
+            allMessages.append(ChatMessage(role: .assistant, text: text, streaming: !isFinal,
+                                           isToolNoise: ChatMessage.looksLikeToolNoise(text)))
             if isFinal { finishTurn() }
         }
     }
@@ -179,9 +336,18 @@ final class ChatStore: ObservableObject {
             totalTurnTokens += turnCharCount / 4
         }
         agentBusy = false
-        if currentTurnViaVoice, let reply = messages.last(where: { $0.role == .assistant })?.text {
-            voice.speak(reply)
+        // Speak the last real reply — never a tool/search payload.
+        if currentTurnViaVoice,
+           let idx = allMessages.lastIndex(where: { $0.role == .assistant && !$0.isToolNoise }) {
+            allMessages[idx].isVoiceReply = true
+            if streamingSpeechStarted {
+                // Already speaking — just flush whatever wasn't covered.
+                voice.endStreamingSpeech(fullText: allMessages[idx].text)
+            } else {
+                voice.speak(allMessages[idx].text)
+            }
         }
+        streamingSpeechStarted = false
         currentTurnViaVoice = false
     }
 

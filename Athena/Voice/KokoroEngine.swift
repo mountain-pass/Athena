@@ -81,23 +81,23 @@ final class KokoroEngine: ObservableObject {
             && FileManager.default.fileExists(atPath: Self.configURL.path)
     }
 
-    #if canImport(Kokoro)
-    private var pipeline: KPipeline?
-    #endif
+    /// Model loading and inference run inside this actor — OFF the main thread.
+    /// (Doing it on @MainActor froze the whole UI, which looked like a hang.)
+    private let runner = KokoroRunner()
 
     // MARK: Loading
 
     func prepare() async {
         #if canImport(Kokoro)
-        guard pipeline == nil else { status = .ready; return }
+        if await runner.isLoaded { status = .ready; return }
         do {
             if !isDownloaded { try await downloadAssets() }
             status = .loading
             try FileManager.default.createDirectory(at: Self.voicesDirectory,
                                                     withIntermediateDirectories: true)
-            let model = try KModel(configURL: Self.configURL, weightsURL: Self.weightsURL)
-            let voices = VoiceLoader(baseDirectory: Self.voicesDirectory, enableDownload: true)
-            pipeline = KPipeline(model: model, voices: voices)
+            try await runner.load(configURL: Self.configURL,
+                                  weightsURL: Self.weightsURL,
+                                  voicesDirectory: Self.voicesDirectory)
             status = .ready
         } catch {
             status = .unavailable(error.localizedDescription)
@@ -144,21 +144,19 @@ final class KokoroEngine: ObservableObject {
     /// Deletes downloaded assets (frees ~330MB).
     func deleteAssets() {
         try? FileManager.default.removeItem(at: Self.assetDirectory)
-        #if canImport(Kokoro)
-        pipeline = nil
-        #endif
+        Task { await runner.unload() }
         status = .notLoaded
     }
 
     // MARK: Synthesis
 
-    /// Returns 24kHz mono WAV data ready for AVAudioPlayer.
+    /// Returns 24kHz mono WAV data ready for AVAudioPlayer. Inference happens
+    /// off the main thread, so the UI stays responsive while speech generates.
     func synthesize(text: String, voice: String) async throws -> Data {
         #if canImport(Kokoro)
-        if pipeline == nil { await prepare() }
-        guard let pipeline else { throw TTSError.notReady }
-        let result = try pipeline.synthesize(text: text, voice: voice)
-        return Self.wavData(from: result.audio, sampleRate: 24_000)
+        if await !runner.isLoaded { await prepare() }
+        guard case .ready = status else { throw TTSError.notReady }
+        return try await runner.synthesizeWAV(text: text, voice: voice)
         #else
         throw TTSError.notAvailable
         #endif
@@ -178,8 +176,9 @@ final class KokoroEngine: ObservableObject {
     }
 
     // MARK: Float samples → WAV container
+    // `nonisolated` so KokoroRunner can call it from its own actor context.
 
-    static func wavData(from samples: [Float], sampleRate: Int) -> Data {
+    nonisolated static func wavData(from samples: [Float], sampleRate: Int) -> Data {
         var data = Data()
         let channels = 1, bitsPerSample = 16
         let byteRate = sampleRate * channels * bitsPerSample / 8

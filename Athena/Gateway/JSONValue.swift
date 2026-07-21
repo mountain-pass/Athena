@@ -1,7 +1,7 @@
 import Foundation
 
 /// Minimal dynamic JSON value used for Gateway protocol payloads.
-enum JSONValue: Codable, Equatable {
+enum JSONValue: Codable, Equatable, Sendable {
     case string(String)
     case number(Double)
     case bool(Bool)

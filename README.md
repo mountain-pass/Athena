@@ -196,6 +196,65 @@ curl -L -C - -o kokoro-v1_0.safetensors "$BASE/kokoro-v1_0.safetensors"   # ~330
 
 ---
 
+## The agent is the product
+
+Athena is a display layer. Anything that looks like intelligence belongs on the
+gateway, not in Swift. On first connect (and via **Settings → Agent → Sync**)
+the app provisions the agent so the backend understands the contract:
+
+- **`AGENTS.md`** — an operating manual: what Athena is, how replies are
+  rendered, the `[voice]` convention and speakable-reply rules, the
+  `news/YYYY-MM-DD.md` archive format, and the instruction to summarize from
+  the archive rather than re-fetching.
+- **`HEARTBEAT.md`** — a `tasks:` block so hourly wakes sweep the feeds.
+- **Cron jobs** — hourly collector, daily brief.
+
+Managed content is fenced between `<!-- ATHENA:BEGIN -->` / `<!-- ATHENA:END -->`
+markers, so hand-written additions to those files survive re-syncs.
+
+### Handshake, not chatter
+
+On connect (once per launch) Athena reads `athena/manifest.json` from the
+workspace. If the contract version and topic fingerprint match, **nothing is
+sent** — the agent already knows its job and normal messages carry no overhead.
+Only a missing/stale manifest triggers the setup write. Changing topics or
+bumping `AgentProvisioner.contractVersion` invalidates it automatically.
+
+### The archive is bidirectional
+
+The agent writes `news/YYYY-MM-DD.md`; the UI reads those same files back via
+`agents.files.get` and parses them into the dashboard. That's how stories
+collected while your Mac was asleep appear when you open the app. Because the
+UI parses it, the manual states plainly that the format is a contract.
+
+Because the rules live server-side, voice turns only need a `[voice]` marker
+instead of restating the whole directive on every message. If provisioning
+hasn't run, the app falls back to sending the full inline directive.
+
+Re-run Sync after changing topics, sources, or the brief time — the manual
+embeds them.
+
+## Concurrency rules
+
+The UI must never block. Anything that can take more than a few milliseconds
+runs off the main actor:
+
+| Work | Where it runs |
+|---|---|
+| Kokoro model load + inference + WAV encoding | `KokoroRunner` (actor) |
+| Reading attachment files | `ChatAttachment.load` (detached task) |
+| Pasted-image → PNG conversion | `ChatAttachment.fromPasteboardImage` |
+| Base64 + JSON encoding of `chat.send` | detached task in `GatewayRPC` |
+| RSS fetch + XML parsing | task group, non-isolated parser |
+| Model weight download | `URLSessionDownloadTask` delegate queue |
+
+The main actor keeps only: SwiftUI state, `NSPasteboard` reads (AppKit
+requirement — but just a buffer copy), and WebSocket frame dispatch.
+
+When adding a feature, ask what it does with a 50MB video or a 2000-word reply.
+If the answer involves a loop over bytes or a synchronous file read, wrap it in
+`Task.detached` or move it into an actor, and surface progress in the UI.
+
 ## Development
 
 - **Code-only changes:** just ⌘R. `xcodegen` is only needed when files are

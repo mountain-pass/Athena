@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import UniformTypeIdentifiers
 
 /// Typed convenience wrappers over the raw Gateway RPC surface.
 extension GatewayClient {
@@ -23,22 +25,28 @@ extension GatewayClient {
     func chatSend(_ text: String,
                   sessionKey: String = mainSessionKey,
                   attachments: [ChatAttachment] = []) async throws -> JSONValue {
-        var params: [String: Any?] = [
-            "sessionKey": sessionKey,
-            "message": text,
-            "idempotencyKey": UUID().uuidString,
-        ]
-        if !attachments.isEmpty {
-            params["attachments"] = attachments.map { att in
-                [
-                    "type": att.kind.rawValue,
-                    "fileName": att.fileName,
-                    "mimeType": att.mimeType,
-                    "content": att.data.base64EncodedString(),
-                ] as [String: Any?]
+        // Base64-encoding a 20MB video on the main thread stalls the UI for
+        // seconds — build the whole payload off-main.
+        let params: JSONValue = await Task.detached(priority: .userInitiated) {
+            var dict: [String: Any?] = [
+                "sessionKey": sessionKey,
+                "message": text,
+                "idempotencyKey": UUID().uuidString,
+            ]
+            if !attachments.isEmpty {
+                dict["attachments"] = attachments.map { att in
+                    [
+                        "type": att.kind.rawValue,
+                        "fileName": att.fileName,
+                        "mimeType": att.mimeType,
+                        "content": att.data.base64EncodedString(),
+                    ] as [String: Any?]
+                }
             }
-        }
-        return try await request("chat.send", .from(params))
+            return JSONValue.from(dict)
+        }.value
+
+        return try await request("chat.send", params)
     }
 
     func chatAbort(sessionKey: String = mainSessionKey) async throws {
@@ -54,18 +62,37 @@ extension GatewayClient {
 
     /// schedule: cron expression, e.g. "0 7 * * *" for 07:00 daily.
     func cronAdd(name: String, schedule: String, prompt: String, enabled: Bool = true) async throws -> JSONValue {
-        try await request("cron.add", .from([
-            "name": name,
-            "schedule": ["kind": "cron", "expr": schedule],
-            "payload": ["kind": "agentTurn", "message": prompt],
-            "enabled": enabled,
+        try await request("cron.add", .object([
+            "name": .string(name),
+            "schedule": .object(["kind": .string("cron"), "expr": .string(schedule)]),
+            "payload": .object(["kind": .string("agentTurn"), "message": .string(prompt)]),
+            "enabled": .bool(enabled),
         ]))
     }
 
+    /// Convenience patch builder matching the gateway's cron schema.
+    static func cronPatch(name: String? = nil, schedule: String? = nil,
+                          prompt: String? = nil, enabled: Bool? = nil) -> JSONValue {
+        var patch: [String: JSONValue] = [:]
+        if let name { patch["name"] = .string(name) }
+        if let schedule {
+            patch["schedule"] = .object(["kind": .string("cron"), "expr": .string(schedule)])
+        }
+        if let prompt {
+            patch["payload"] = .object(["kind": .string("agentTurn"), "message": .string(prompt)])
+        }
+        if let enabled { patch["enabled"] = .bool(enabled) }
+        return .object(patch)
+    }
+
+    /// Schema: `{ id, patch: { … } }` — fields must nest under `patch`.
+    /// Schema requires changes nested under `patch` — never merged at root.
+    /// Built explicitly so no `Any?` bridging can flatten it.
     func cronUpdate(id: String, patch: JSONValue) async throws -> JSONValue {
-        var p = patch.objectValue ?? [:]
-        p["id"] = .string(id)
-        return try await request("cron.update", .object(p))
+        try await request("cron.update", .object([
+            "id": .string(id),
+            "patch": patch,
+        ]))
     }
 
     func cronRemove(id: String) async throws {
@@ -97,11 +124,56 @@ extension GatewayClient {
     }
 }
 
-struct ChatAttachment: Identifiable {
-    enum Kind: String { case image, video, file, audio }
+struct ChatAttachment: Identifiable, Sendable {
+    enum Kind: String, Sendable { case image, video, file, audio }
     let id = UUID()
     let kind: Kind
     let fileName: String
     let mimeType: String
     let data: Data
+
+    var byteLabel: String {
+        ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
+    }
+
+    /// Reads a file off the main thread — large videos would otherwise freeze
+    /// the UI for seconds while `Data(contentsOf:)` blocks.
+    static func load(from url: URL) async -> ChatAttachment? {
+        await Task.detached(priority: .userInitiated) { () -> ChatAttachment? in
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+            let type = UTType(filenameExtension: url.pathExtension) ?? .data
+            let kind: Kind =
+                type.conforms(to: .image) ? .image :
+                type.conforms(to: .movie) ? .video :
+                type.conforms(to: .audio) ? .audio : .file
+            return ChatAttachment(
+                kind: kind,
+                fileName: url.lastPathComponent,
+                mimeType: type.preferredMIMEType ?? "application/octet-stream",
+                data: data)
+        }.value
+    }
+
+    /// Normalizes pasted image bytes to PNG off the main thread.
+    static func fromPasteboardImage(data: Data, isPNG: Bool) async -> ChatAttachment? {
+        await Task.detached(priority: .userInitiated) { () -> ChatAttachment? in
+            let png: Data
+            if isPNG {
+                png = data
+            } else if let rep = NSBitmapImageRep(data: data),
+                      let converted = rep.representation(using: .png, properties: [:]) {
+                png = converted
+            } else {
+                return nil
+            }
+            let stamp = Date().formatted(.dateTime.hour().minute().second())
+                .replacingOccurrences(of: ":", with: "-")
+            return ChatAttachment(kind: .image,
+                                  fileName: "pasted-\(stamp).png",
+                                  mimeType: "image/png",
+                                  data: png)
+        }.value
+    }
 }
