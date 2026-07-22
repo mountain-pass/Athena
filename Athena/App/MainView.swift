@@ -22,7 +22,9 @@ struct MainView: View {
                 }
             }
             HStack(alignment: .top, spacing: 12) {
-                if app.selectedTab != .news {
+                // News and Jobs are full-width workspaces — the orb/todo column
+                // is chat furniture and only crowds them.
+                if app.selectedTab == .chat {
                     LeftColumn()
                         .frame(width: 260)
                         .transition(.move(edge: .leading).combined(with: .opacity))

@@ -109,10 +109,23 @@ final class ParakeetSTT: ObservableObject {
     // setup prompt for the download up front instead of stalling the first
     // recording behind a silent 600MB fetch.
 
-    /// Where FluidAudio caches its CoreML bundles.
-    static var cacheDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+    /// Where FluidAudio keeps its CoreML bundles.
+    ///
+    /// On macOS this is Application Support — the SAME persistent, app-owned
+    /// location Kokoro uses, so the model survives relaunches and is never
+    /// re-downloaded once present. (FluidAudio's own docs disagree on the
+    /// path: the README says `~/.cache/fluidaudio`, the manual-loading guide
+    /// says Application Support. We scan both so detection is correct
+    /// regardless of which the linked version actually uses.)
+    static var cacheDirectory: URL { candidateDirectories[0] }
+
+    static var candidateDirectories: [URL] {
+        let fm = FileManager.default
+        let appSupport = (fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)?
+            .appendingPathComponent("FluidAudio/Models", isDirectory: true)
+        let dotCache = fm.homeDirectoryForCurrentUser
             .appendingPathComponent(".cache/fluidaudio/Models", isDirectory: true)
+        return [appSupport, dotCache].compactMap { $0 }
     }
 
     /// True when Parakeet weights are already on disk.
@@ -174,26 +187,34 @@ final class ParakeetSTT: ObservableObject {
         }
     }
 
-    /// Cheap disk check, off the main thread.
+    /// Cheap disk check, off the main thread. Scans every candidate cache
+    /// location (see cacheDirectory) so detection works no matter where the
+    /// linked FluidAudio version puts the bundles.
     func refreshDownloadState() {
-        let dir = Self.cacheDirectory
+        let dirs = Self.candidateDirectories
+        // The current version's folder tag, e.g. "v3" — so a downloaded v3
+        // isn't mistaken for the v2 the user just switched to.
+        let versionTag = modelVersion == .v3 ? "v3" : "v2"
         Task.detached(priority: .utility) { [weak self] in
             let fm = FileManager.default
             var bytes: Int64 = 0
             var found = false
-            // Total everything in the cache: mid-download FluidAudio may be
-            // writing to temporary names, so restricting the byte count to
-            // "parakeet"-named entries would leave the progress bar at zero
-            // for most of the download.
-            if let e = fm.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey]) {
+            for dir in dirs {
+                // Walk the WHOLE tree: sum bytes AND look for a parakeet bundle
+                // at any depth. FluidAudio nests models under the HF org
+                // (…/Models/FluidInference/parakeet-tdt-0.6b-v3-coreml), so a
+                // top-level-only name check found "FluidInference" and missed
+                // the model entirely — which made a downloaded model read as
+                // absent on every relaunch.
+                guard let e = fm.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey])
+                else { continue }
                 for case let f as URL in e {
                     bytes += Int64((try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                    let name = f.lastPathComponent.lowercased()
+                    // The bundle folder carries both, e.g.
+                    // "parakeet-tdt-0.6b-v3-coreml".
+                    if name.contains("parakeet"), name.contains(versionTag) { found = true }
                 }
-            }
-            // Completion, though, requires the real bundle to exist by name.
-            if let entries = try? fm.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: nil) {
-                found = entries.contains { $0.lastPathComponent.lowercased().contains("parakeet") }
             }
             // A partial download is worse than none — it loads and then fails.
             let complete = found && bytes > 100_000_000
@@ -217,11 +238,13 @@ final class ParakeetSTT: ObservableObject {
     func deleteDownload() {
         loadTask?.cancel(); loadTask = nil
         progressPoll?.cancel(); progressPoll = nil
-        let dir = Self.cacheDirectory
+        let dirs = Self.candidateDirectories
         Task { [weak self] in
             await self?.runner.unload()
-            try? FileManager.default.removeItem(at: dir)
-            NSLog("[parakeet] cleared model cache at %@", dir.path)
+            for dir in dirs {
+                try? FileManager.default.removeItem(at: dir)
+                NSLog("[parakeet] cleared model cache at %@", dir.path)
+            }
             await MainActor.run { [weak self] in
                 self?.status = .notLoaded
                 self?.refreshDownloadState()

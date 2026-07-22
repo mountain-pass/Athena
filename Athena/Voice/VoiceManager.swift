@@ -3,6 +3,19 @@ import AVFoundation
 import Speech
 import AppKit
 
+/// Thread-safe buffer counter written from the real-time audio thread and
+/// read from the main actor. The mic tap fires on CoreAudio's own thread, so
+/// the ONLY truthful "is audio flowing" signal is one incremented right there,
+/// synchronously — not a value updated via a main-actor hop that can lag or be
+/// starved. Getting this wrong is what made a working mic report "no audio".
+final class AudioFlowCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func reset() { lock.lock(); value = 0; lock.unlock() }
+    func increment() { lock.lock(); value += 1; lock.unlock() }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+}
+
 /// One recognition segment's text.
 ///
 /// Deliberately NOT main-actor isolated: Speech delivers callbacks on its own
@@ -247,7 +260,14 @@ final class VoiceManager: NSObject, ObservableObject {
     /// Called with the final transcript when the user releases space.
     var onTranscriptFinal: ((String) -> Void)?
 
+    // ONE engine for the whole app lifetime. Creating a new engine per session
+    // was the cause of the "error 35 / resource busy" failures: each new engine
+    // tried to grab the input device before the previous engine's async device
+    // teardown had finished, so the mic was still held and the tap never fired.
+    // A single engine acquires the device once and re-uses it cleanly.
     private let audioEngine = AVAudioEngine()
+    /// Guards against an endless start→no-audio→restart loop.
+    private var didRetryEngineStart = false
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
@@ -447,12 +467,8 @@ final class VoiceManager: NSObject, ObservableObject {
         }
 
         stopSpeaking()
-        // Tear down any previous session. NOTE: do NOT call audioEngine.reset()
-        // here. On macOS 15 that drops the engine's HAL input proxy, and the
-        // next inputNode access rebuilds it with the *default* (not hardware)
-        // format — which is where the -10877 kAudioUnitErr_InvalidElement
-        // storm and the silent "no audio ever reached the recognizer" failure
-        // came from. Stopping and removing the tap is sufficient.
+
+        // Clear all per-session state.
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
@@ -460,122 +476,85 @@ final class VoiceManager: NSObject, ObservableObject {
         segmentTimer = nil
         previewTimer?.invalidate()
         previewTimer = nil
-        if audioEngine.isRunning { audioEngine.stop() }
-        removeInputTap()
+        teardownEngine()
 
         resetTranscript(reason: "new session")
         sampleBuffer.reset()
+        flowCounter.reset()
         previewSuppressed = false
+        didRetryEngineStart = false
 
-        // One long-lived audio tap. With Apple, recognition requests rotate
-        // underneath it; with Parakeet it just fills a sample buffer.
-        let input = audioEngine.inputNode
+        // Single persistent engine (see its declaration). We only reconfigure
+        // its tap each session; we never replace the engine.
+        _ = audioEngine.inputNode
 
-        // prepare() FIRST, then read the format. The input node only settles
-        // onto the real hardware format once the engine has been prepared;
-        // querying before that can return a stale or half-built description.
-        // (This is why we saw 24000Hz — Kokoro's synthesis rate — for a mic
-        // that actually runs at 48k. Declaring half the true sample rate made
-        // the tap hand the recognizer mangled audio, so 14s of speech came
-        // back as four words.)
-        audioEngine.prepare()
-
-        // outputFormat, not inputFormat: for AVAudioEngine's input node the
-        // *output* side of bus 0 is what the tap receives. This is Apple's
-        // documented pattern; inputFormat describes the hardware side and does
-        // not necessarily match what installTap will deliver.
-        let format = input.outputFormat(forBus: 0)
-
-        // Guard against the invalid-format crash: no input device, device in
-        // use elsewhere, or permissions revoked mid-session.
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            NSLog("[voice] invalid input format (%.0fHz, %d ch) — aborting",
-                  format.sampleRate, format.channelCount)
+        // Use the HARDWARE format. A tap MUST be installed at the rate the
+        // device actually delivers. `outputFormat(forBus:)` can report a stale
+        // 48kHz while the real device (e.g. AirPods at 24kHz) differs, and
+        // installing a tap at the wrong rate fails with "Format mismatch /
+        // Failed to create tap" and delivers nothing. `inputFormat` is the
+        // device's true current format.
+        guard let format = currentInputFormat() else {
+            NSLog("[voice] invalid input format — aborting")
             state = .idle
             listeningSince = nil
             lastError = "No usable microphone input. Check System Settings → Privacy & Security → Microphone."
             return
         }
-        NSLog("[voice] input format: %.0fHz, %d ch — STT engine: %@",
+        NSLog("[voice] input format (hardware): %.0fHz, %d ch — STT engine: %@",
               format.sampleRate, format.channelCount, sttEngine.rawValue)
 
-        listeningSince = .now
-        state = .listening
-        tapBufferCount = 0
-
-        // Captured by the (single) audio thread, so a plain local is fine and
-        // avoids touching main-actor state from a real-time callback.
-        var verifiedTapFormat = false
         let usingParakeet = sttEngine == .parakeet
-
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            guard let self else { return }
-            // Verify once that what we're handed matches what we declared. A
-            // mismatch means the recognizer is being fed audio at the wrong
-            // rate, which degrades it to near-noise — worth screaming about.
-            if !verifiedTapFormat {
-                verifiedTapFormat = true
-                let actual = buffer.format
-                if abs(actual.sampleRate - format.sampleRate) > 1
-                    || actual.channelCount != format.channelCount {
-                    NSLog("[voice] TAP FORMAT MISMATCH — declared %.0fHz/%dch, got %.0fHz/%dch",
-                          format.sampleRate, format.channelCount,
-                          actual.sampleRate, actual.channelCount)
-                } else {
-                    NSLog("[voice] tap format confirmed: %.0fHz/%dch, %d frames/buffer",
-                          actual.sampleRate, actual.channelCount, buffer.frameLength)
-                }
-            }
-            if usingParakeet {
-                // Batch model: just bank the audio. Resampling to 16kHz mono
-                // happens inside, off the main actor.
-                self.sampleBuffer.append(buffer)
-            } else {
-                // Feed whichever request is current right now.
-                self.recognitionRequest?.append(buffer)
-            }
-            let rms = Self.rmsLevel(buffer)
-            Task { @MainActor in
-                self.tapBufferCount += 1
-                self.level = rms
-            }
-        }
-        tapInstalled = true
+        reinstallTap(format: format)
 
         if !usingParakeet { startSegment() }
 
+        // prepare() then start(). prepare() here (after tap install, before
+        // start) is the ordering Apple's own samples use for input capture.
+        audioEngine.prepare()
         do {
             try audioEngine.start()
         } catch {
             NSLog("[voice] audio engine start failed: %@", error.localizedDescription)
-            removeInputTap()
+            teardownEngine()
             state = .idle
             listeningSince = nil
             lastError = "Couldn't start the microphone: \(error.localizedDescription)"
             return
         }
+        NSLog("[voice] engine started (running=%@)", audioEngine.isRunning ? "yes" : "no")
 
-        // Watchdog: if the tap never fires, the mic is dead and the user would
-        // otherwise talk into a void and get an empty message. Say so.
+        listeningSince = .now
+        state = .listening
+
+        // Verify audio actually flows. `running=yes` only means the engine's
+        // graph started — the HAL device start can still fail asynchronously
+        // with error 35 (device busy), in which case the tap never fires.
+        // Check the thread-safe counter shortly after start; if nothing has
+        // arrived, the device was busy, so stop and try once more after a beat
+        // to let it release. This is what actually recovers from error 35.
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            guard self.state == .listening, self.tapBufferCount == 0 else { return }
-            NSLog("[voice] no audio buffers after 1.5s — input is dead")
-            self.lastError = "No audio is reaching the microphone. Check System Settings → Sound → Input, then try again."
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard self.state == .listening else { return }
+            if self.flowCounter.count > 0 {
+                NSLog("[voice] audio confirmed flowing (%d buffers)", self.flowCounter.count)
+                return
+            }
+            if !self.didRetryEngineStart {
+                self.didRetryEngineStart = true
+                NSLog("[voice] no audio yet — device likely busy, restarting engine once")
+                self.restartEngineForFlow()
+            } else {
+                NSLog("[voice] no audio after retry — input is dead")
+                self.lastError = "No audio is reaching the microphone. Another app may be using it, or check System Settings → Sound → Input."
+            }
         }
 
         if usingParakeet {
-            // Rolling preview so there's text on screen while you speak. The
-            // authoritative transcription happens once, on release.
             previewTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.runPreviewPass() }
             }
         } else {
-            // Apple only. Silence watchdog: we do NOT trust the recognizer to
-            // tell us about pauses — on-device dictation often goes dormant
-            // after a few seconds of silence, emitting no final, no error, and
-            // no further callbacks. So we track when the last hypothesis
-            // arrived and rotate segments ourselves.
             segmentTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.watchdogTick() }
             }
@@ -637,13 +616,12 @@ final class VoiceManager: NSObject, ObservableObject {
         segmentTimer = nil
         level = 0
         listeningSince = nil
-        audioEngine.stop()
-        removeInputTap()
+        teardownEngine()
 
         let samples = sampleBuffer.snapshot()
         let seconds = Double(samples.count) / ParakeetAudio.sampleRate
         NSLog("[voice] captured %.1fs of audio (%d buffers) — transcribing",
-              seconds, tapBufferCount)
+              seconds, flowCounter.count)
 
         // First run: the model may still be downloading. The audio is safe in
         // the buffer and will transcribe as soon as it's loaded — say so
@@ -734,13 +712,104 @@ final class VoiceManager: NSObject, ObservableObject {
 
     /// Removing a tap from a bus that has none throws -10877, so track it.
     private var tapInstalled = false
-    /// Buffers delivered by the tap this session — proves audio is flowing.
-    private var tapBufferCount = 0
+    /// Buffers delivered by the tap this session — the truthful, thread-safe
+    /// proof that audio is flowing (see AudioFlowCounter).
+    private let flowCounter = AudioFlowCounter()
 
     private func removeInputTap() {
         guard tapInstalled else { return }
         audioEngine.inputNode.removeTap(onBus: 0)
         tapInstalled = false
+    }
+
+    /// The microphone's true current format. Prefers the hardware side
+    /// (`inputFormat`); falls back to the graph side only if that's unusable.
+    /// A tap installed at anything other than the hardware rate fails to
+    /// create, which is exactly the 24kHz-device / 48kHz-tap mismatch bug.
+    private func currentInputFormat() -> AVAudioFormat? {
+        let input = audioEngine.inputNode
+        let hw = input.inputFormat(forBus: 0)
+        if hw.sampleRate > 0, hw.channelCount > 0 { return hw }
+        let out = input.outputFormat(forBus: 0)
+        if out.sampleRate > 0, out.channelCount > 0 { return out }
+        return nil
+    }
+
+    /// Installs the mic tap. Shared by the initial start and the device-busy
+    /// retry so both feed audio identically.
+    private func reinstallTap(format: AVAudioFormat) {
+        removeInputTap()
+        let usingParakeet = sttEngine == .parakeet
+        var loggedFirstBuffer = false
+        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            guard let self else { return }
+            // Count EVERY buffer synchronously on the audio thread — this is
+            // the watchdog's source of truth.
+            self.flowCounter.increment()
+            if !loggedFirstBuffer {
+                loggedFirstBuffer = true
+                NSLog("[voice] first buffer: %.0fHz/%dch, %d frames",
+                      buffer.format.sampleRate, buffer.format.channelCount, buffer.frameLength)
+            }
+            if usingParakeet {
+                self.sampleBuffer.append(buffer)
+            } else {
+                self.recognitionRequest?.append(buffer)
+            }
+            // Level meter is the only thing that needs the main actor, and it
+            // tolerates being dropped — so a plain Task is fine here.
+            let rms = Self.rmsLevel(buffer)
+            Task { @MainActor in self.level = rms }
+        }
+        tapInstalled = true
+    }
+
+    /// Stops the engine and removes the tap, releasing the input device.
+    private func teardownEngine() {
+        removeInputTap()
+        if audioEngine.isRunning { audioEngine.stop() }
+    }
+
+    /// Recovery from a device-busy (error 35) start: the HAL reported the
+    /// input device busy so the tap never fired. Stop the engine to force the
+    /// device to release, wait briefly, then re-arm the SAME tap and restart.
+    /// Runs entirely on the existing session's engine — no new engine, so no
+    /// second client fighting for the device.
+    private func restartEngineForFlow() {
+        guard state == .listening else { return }
+        // Tear the tap + stop, then let the device settle before re-arming.
+        teardownEngine()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard state == .listening else { return }
+            // Re-read the format AFTER the device settles — it may have just
+            // finished a config change (the reason the first tap failed).
+            guard let format = currentInputFormat() else {
+                lastError = "No usable microphone input."
+                state = .idle
+                return
+            }
+            reinstallTap(format: format)
+            audioEngine.prepare()
+            do {
+                try audioEngine.start()
+                NSLog("[voice] engine restarted after device-busy")
+            } catch {
+                NSLog("[voice] restart failed: %@", error.localizedDescription)
+                lastError = "Couldn't start the microphone: \(error.localizedDescription)"
+                state = .idle
+                return
+            }
+            // Final verdict a moment later.
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard state == .listening else { return }
+            if flowCounter.count == 0 {
+                NSLog("[voice] still no audio after restart — input is dead")
+                lastError = "No audio is reaching the microphone. Another app may be using it, or check System Settings → Sound → Input."
+            } else {
+                NSLog("[voice] audio flowing after restart (%d buffers)", flowCounter.count)
+            }
+        }
     }
 
     /// Starts a fresh recognition request. Transcription runs on the Speech
@@ -887,9 +956,8 @@ final class VoiceManager: NSObject, ObservableObject {
         listeningSince = nil
 
         // Stop capturing, then let the recognizer drain what it already has.
-        audioEngine.stop()
-        removeInputTap()
-        NSLog("[voice] stopping — %d audio buffers captured", tapBufferCount)
+        teardownEngine()
+        NSLog("[voice] stopping — %d audio buffers captured", flowCounter.count)
         recognitionRequest?.endAudio()
 
         Task { @MainActor in
