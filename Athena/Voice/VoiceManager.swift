@@ -277,8 +277,6 @@ final class VoiceManager: NSObject, ObservableObject {
     private var audioPlayer: AVAudioPlayer?
     private var meterTimer: Timer?
     private var serverFetchTask: Task<Void, Never>?
-    private var chunkQueue: [String] = []
-    private var prefetchTask: Task<Data?, Never>?
     private var segmentTimer: Timer?
     /// Apple ends a recognition task after ~60s. Rotate before that so long
     /// dictation continues seamlessly.
@@ -405,7 +403,7 @@ final class VoiceManager: NSObject, ObservableObject {
                 return nil
             }
             if event.keyCode == 53, event.type == .keyDown,
-               self.state == .speaking || self.streamActive || self.audioPlayer != nil {
+               self.state == .speaking || self.audioPlayer != nil || self.speechPump != nil {
                 self.stopSpeaking()
                 return nil
             }
@@ -1028,41 +1026,48 @@ final class VoiceManager: NSObject, ObservableObject {
     /// chunk pipeline (synthesize-ahead while playing). These exist to stop a
     /// runaway payload from queuing hundreds of synthesis jobs.
     static let maxSpeakCharacters = 12_000   // ~15 minutes of speech
-    static let maxChunks = 80
 
-    /// Preview/testing entry point — ignores the voiceReplies toggle.
+    /// Speaks a finished reply. Ignores the voiceReplies toggle (callers gate
+    /// on it). ALL heavy work — markdown stripping, sentence splitting — runs
+    /// off the main thread; only the quick tool-noise reject is on-main.
     func speakNow(_ rawText: String) {
-        // Refuse machine payloads outright.
         guard !ChatMessage.looksLikeToolNoise(rawText) else {
             NSLog("[voice] refusing to speak tool output (%d chars)", rawText.count)
             return
         }
-
-        var text = Self.speakableText(rawText, keepEmotionTags: engine.supportsEmotion)
-        guard !text.isEmpty else { return }
-
-        if text.count > Self.maxSpeakCharacters {
-            // Cut at a sentence boundary near the limit.
-            let cutoff = text.index(text.startIndex, offsetBy: Self.maxSpeakCharacters)
-            let head = String(text[text.startIndex..<cutoff])
-            if let lastStop = head.lastIndex(where: { ".!?".contains($0) }) {
-                text = String(head[head.startIndex...lastStop])
-            } else {
-                text = head
-            }
-            text += " That's the short version — the rest is in the chat."
-        }
-
         stopSpeaking()
-        switch engine {
-        case .system:
-            // AVSpeechSynthesizer already starts almost instantly.
-            speakSystem(text)
-        case .kokoro, .cosyVoice, .server:
-            // Neural engines synthesize a whole request before any audio
-            // exists, so long replies would sit silent for seconds. Split
-            // into sentence chunks: speak chunk 1 while chunk 2 renders.
-            startChunkedPlayback(text)
+
+        let keepTags = engine.supportsEmotion
+        let isSystemEngine = (engine == .system)
+        let limit = Self.maxSpeakCharacters
+
+        // Prepare off the main actor: regex cleaning of a long reply can take
+        // tens of milliseconds and must never touch the main thread. When it's
+        // done, hop back and start playback.
+        ttsPrepTask?.cancel()
+        ttsPrepTask = Task.detached(priority: .userInitiated) { [weak self] in
+            var text = VoiceManager.speakableText(rawText, keepEmotionTags: keepTags)
+            guard !text.isEmpty else { return }
+            if text.count > limit {
+                let cutoff = text.index(text.startIndex, offsetBy: limit)
+                let head = String(text[text.startIndex..<cutoff])
+                if let lastStop = head.lastIndex(where: { ".!?".contains($0) }) {
+                    text = String(head[head.startIndex...lastStop])
+                } else {
+                    text = head
+                }
+                text += " That's the short version — the rest is in the chat."
+            }
+            let sentences = VoiceManager.splitIntoSentences(text)
+            let systemText = text
+            await MainActor.run { [weak self] in
+                guard let self, !Task.isCancelled else { return }
+                if isSystemEngine {
+                    self.speakSystem(systemText)   // starts almost instantly
+                } else {
+                    self.startPump(with: sentences)
+                }
+            }
         }
     }
 
@@ -1072,97 +1077,173 @@ final class VoiceManager: NSObject, ObservableObject {
     // Instead we start speaking the first complete sentence while the rest of
     // the reply is still arriving from the gateway.
 
-    private var streamConsumedCount = 0
-    private var streamActive = false
+    // MARK: Serial speech pump
+    //
+    // Design: TTS is REACTIVE and fully off the main thread. The chat store
+    // hands us a finished reply (once the turn completes over the WebSocket);
+    // nothing runs per-delta on the network hot path. All cleaning, sentence
+    // splitting, and synthesis happen off the main actor, so a slow reply — or
+    // a huge one — never blocks or freezes the UI.
+    //
+    // ONE consumer task ("the pump") owns all playback for a reply. It renders
+    // one utterance ahead while the current plays, and awaits each clip's
+    // completion before starting the next — so playback is gapless and strictly
+    // in order, while still starting on the first sentence rather than waiting
+    // for the whole thing to synthesize.
 
-    func beginStreamingSpeech() {
-        guard voiceReplies else { return }
-        stopSpeaking()
-        interrupted = false          // a new turn clears the interrupt
-        streamConsumedCount = 0
-        streamActive = true
-        state = .speaking          // claim the state so nothing else interrupts
+    /// Sentences waiting to be spoken, in order.
+    private var sentenceQueue: [String] = []
+    /// The single playback consumer for the current reply.
+    private var speechPump: Task<Void, Never>?
+    /// Off-main text cleaning + sentence splitting for the current reply.
+    private var ttsPrepTask: Task<Void, Never>?
+    /// One-utterance-ahead synthesis, so the next clip is ready when the
+    /// current finishes.
+    private var prefetch: Task<Data?, Never>?
+    /// Resumed by the player delegate when a clip finishes.
+    private var playbackContinuation: CheckedContinuation<Void, Never>?
+    /// Set when neural synthesis fails and we hand the rest to the system
+    /// voice; stops the pump's exit from cutting that speech off.
+    private var handedToSystemVoice = false
+
+    /// Starts speaking a set of pre-split sentences. Only touches main-actor
+    /// state (fast); all heavy work already happened off-main in `prepareAndSpeak`.
+    private func startPump(with sentences: [String]) {
+        guard !sentences.isEmpty else { return }
+        interrupted = false
+        handedToSystemVoice = false
+        sentenceQueue = sentences
+        state = .speaking
+        startSpeechPump()
     }
 
-    /// Feed the reply-so-far; any newly completed sentences are queued.
-    func appendStreamingSpeech(fullTextSoFar: String) {
-        guard !interrupted, streamActive, voiceReplies else { return }
-        guard !ChatMessage.looksLikeToolNoise(fullTextSoFar) else { return }
-
-        let clean = Self.speakableText(fullTextSoFar, keepEmotionTags: engine.supportsEmotion)
-        guard clean.count > streamConsumedCount else { return }
-
-        // Only take up to the last completed sentence.
-        let pending = String(clean.dropFirst(streamConsumedCount))
-        guard let lastStop = pending.lastIndex(where: { ".!?".contains($0) }) else { return }
-        let ready = String(pending[pending.startIndex...lastStop])
-        guard ready.count > 20 else { return }      // wait for something worth saying
-
-        streamConsumedCount += ready.count
-        let newChunks = Self.splitIntoChunks(ready, firstChunkTarget: 60)
-        chunkQueue.append(contentsOf: newChunks)
-
-        // Kick playback if nothing is currently sounding.
-        if audioPlayer == nil, !synthesizer.isSpeaking, prefetchTask == nil {
-            Task { await playNextChunk() }
+    private func startSpeechPump() {
+        speechPump?.cancel()
+        prefetch?.cancel(); prefetch = nil
+        var spokenAnything = false
+        speechPump = Task { @MainActor [weak self] in
+            guard let self else { return }
+            // `Task.isCancelled` — not just `interrupted` — because a new turn
+            // resets `interrupted` to false right after cancelling the old
+            // pump; without this the retired pump would keep looping.
+            while !self.interrupted, !Task.isCancelled {
+                guard let data = await self.nextClip(first: !spokenAnything) else { break }
+                spokenAnything = true
+                guard !self.interrupted, !Task.isCancelled else { break }
+                // Kick synthesis of the following utterance while this plays.
+                self.schedulePrefetch()
+                await self.playAndAwait(data)
+            }
+            // Don't clobber a system-voice fallback that's mid-sentence, and
+            // don't touch state if we were cancelled by a newer turn.
+            if !self.interrupted, !Task.isCancelled, !self.handedToSystemVoice {
+                self.finishSpeaking()
+            }
         }
     }
 
-    /// Final flush — speaks whatever's left after the last sentence boundary.
-    func endStreamingSpeech(fullText: String) {
-        guard !interrupted else { return }   // user stopped this turn
-        guard streamActive else { return }
-        streamActive = false
-        guard voiceReplies, !ChatMessage.looksLikeToolNoise(fullText) else {
-            if state == .speaking && audioPlayer == nil { state = .idle }
+    /// Returns the next clip's audio, or nil when the reply is fully spoken.
+    /// Consumes the prefetched result first so order is preserved. The whole
+    /// reply is known when the pump starts, so an empty queue means we're done.
+    private func nextClip(first: Bool) async -> Data? {
+        guard !interrupted, !Task.isCancelled else { return nil }
+        if let p = prefetch {
+            prefetch = nil
+            return await p.value
+        }
+        if let utterance = dequeueUtterance(first: first) {
+            return await synthesizeChunk(utterance)
+        }
+        return nil
+    }
+
+    private func schedulePrefetch() {
+        guard prefetch == nil, !interrupted else { return }
+        guard let utterance = dequeueUtterance(first: false) else { return }
+        prefetch = Task { [weak self] in await self?.synthesizeChunk(utterance) ?? nil }
+    }
+
+    /// Pulls the next utterance to synthesize. The FIRST utterance is a single
+    /// sentence so audio starts as fast as possible; later utterances combine
+    /// sentences up to a target length so transitions are infrequent and the
+    /// speech flows.
+    private func dequeueUtterance(first: Bool) -> String? {
+        guard !sentenceQueue.isEmpty else { return nil }
+        if first { return sentenceQueue.removeFirst() }
+        var combined = sentenceQueue.removeFirst()
+        while let next = sentenceQueue.first, combined.count + next.count + 1 <= 240 {
+            combined += " " + sentenceQueue.removeFirst()
+        }
+        return combined
+    }
+
+    /// Plays one clip and suspends until it finishes (or is stopped). This is
+    /// what serializes playback — the pump can't start the next clip until this
+    /// resumes, so two clips can never sound at once.
+    private func playAndAwait(_ data: Data) async {
+        guard data.count > 1024 else {
+            NSLog("[voice] skipping empty audio buffer (%d bytes)", data.count)
             return
         }
-        let clean = Self.speakableText(fullText, keepEmotionTags: engine.supportsEmotion)
-        if clean.count > streamConsumedCount {
-            let remainder = String(clean.dropFirst(streamConsumedCount))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !remainder.isEmpty {
-                chunkQueue.append(contentsOf: Self.splitIntoChunks(remainder))
+        guard state == .speaking, !interrupted else { return }
+        playbackToken &+= 1
+        let token = playbackToken
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            do {
+                let player = try AVAudioPlayer(data: data)
+                player.delegate = self
+                player.isMeteringEnabled = true
+                audioPlayer = player
+                playbackContinuation = cont
+                let ok = player.play()
+                startMeter()
+                if !ok {
+                    // play() can fail silently while a Bluetooth device is
+                    // reconfiguring (HFP↔A2DP). The finish delegate then never
+                    // fires, so resume ourselves rather than hang the pump.
+                    NSLog("[voice] player.play() returned false — skipping clip")
+                    resumePlayback()
+                    return
+                }
+                // Safety net: if the delegate never fires (device reconfig,
+                // route loss), advance after the clip's own duration + margin
+                // so a single bad clip can't stall the whole reply.
+                let timeout = player.duration + 1.5
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    guard self.playbackToken == token, self.playbackContinuation != nil else { return }
+                    NSLog("[voice] playback watchdog fired after %.1fs — advancing", timeout)
+                    self.audioPlayer?.stop()
+                    self.audioPlayer = nil
+                    self.resumePlayback()
+                }
+            } catch {
+                NSLog("[voice] playback failed: %@", error.localizedDescription)
+                cont.resume()
             }
         }
-        if audioPlayer == nil, !synthesizer.isSpeaking, prefetchTask == nil {
-            Task { await playNextChunk() }
-        }
-        if chunkQueue.isEmpty, audioPlayer == nil, state == .speaking { state = .idle }
     }
 
-    // MARK: Chunked playback (low latency + interruptible)
+    /// Identifies the current clip so a stale watchdog can't resume a newer one.
+    private var playbackToken: UInt64 = 0
 
-    private func startChunkedPlayback(_ text: String) {
-        chunkQueue = Array(Self.splitIntoChunks(text).prefix(Self.maxChunks))
-        guard !chunkQueue.isEmpty else { return }
-        state = .speaking
-        Task { await playNextChunk() }
-    }
-
-    private func playNextChunk() async {
-        guard state == .speaking else { return }
-        guard !chunkQueue.isEmpty else { finishSpeaking(); return }
-
-        let chunk = chunkQueue.removeFirst()
-        // Use the audio we rendered ahead of time, if any.
-        let data: Data?
-        if let task = prefetchTask {
-            prefetchTask = nil
-            data = await task.value
-        } else {
-            data = await synthesizeChunk(chunk)
-        }
-
-        // Start rendering the next chunk while this one plays.
-        if let next = chunkQueue.first {
-            prefetchTask = Task { [weak self] in
-                await self?.synthesizeChunk(next) ?? nil
+    private func startMeter() {
+        meterTimer?.invalidate()
+        meterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, let p = self.audioPlayer, p.isPlaying else { return }
+                p.updateMeters()
+                let db = p.averagePower(forChannel: 0)
+                self.level = max(0, min(1, (db + 40) / 40))
             }
         }
+    }
 
-        guard state == .speaking, let data else { finishSpeaking(); return }
-        do { try playAudio(data) } catch { finishSpeaking() }
+    /// Resumes the pump after a clip ends or is stopped. Idempotent.
+    private func resumePlayback() {
+        let cont = playbackContinuation
+        playbackContinuation = nil
+        cont?.resume()
     }
 
     /// Surfaced in the HUD when synthesis is waiting on a cold model.
@@ -1208,18 +1289,24 @@ final class VoiceManager: NSObject, ObservableObject {
         } catch {
             NSLog("[voice] synthesis failed (%@) — falling back to system voice",
                   error.localizedDescription)
-            // Speak the remainder with the system voice rather than going silent.
-            let remainder = ([chunk] + chunkQueue).joined(separator: " ")
-            chunkQueue = []
+            // Speak the remainder with the system voice rather than going
+            // silent. Mark the handoff so the pump's exit won't cut it off.
+            let remainder = ([chunk] + sentenceQueue).joined(separator: " ")
+            sentenceQueue = []
+            prefetch?.cancel(); prefetch = nil
+            handedToSystemVoice = true
             speakSystem(remainder)
             return nil
         }
     }
 
     private func finishSpeaking() {
-        prefetchTask?.cancel()
-        prefetchTask = nil
-        chunkQueue = []
+        prefetch?.cancel()
+        prefetch = nil
+        ttsPrepTask = nil
+        sentenceQueue = []
+        speechPump = nil
+        meterTimer?.invalidate()
         if state == .speaking { state = .idle; level = 0 }
     }
 
@@ -1228,7 +1315,7 @@ final class VoiceManager: NSObject, ObservableObject {
     /// - Parameter keepEmotionTags: CosyVoice acts on inline `(happy)` /
     ///   `(whispers)` tags, so they must survive; other engines would read
     ///   them aloud, so they're removed.
-    static func speakableText(_ raw: String, keepEmotionTags: Bool = false) -> String {
+    nonisolated static func speakableText(_ raw: String, keepEmotionTags: Bool = false) -> String {
         // Regex over a huge string is slow — bound the input first.
         var s = raw.count > 20_000 ? String(raw.prefix(20_000)) : raw
 
@@ -1274,6 +1361,34 @@ final class VoiceManager: NSObject, ObservableObject {
 
     /// Splits on sentence boundaries, keeping chunks small enough that the
     /// first one renders fast but large enough to sound natural.
+    /// Splits text into individual sentences, keeping terminal punctuation.
+    /// Fragments too short to be a real sentence are merged into the previous
+    /// one so we never synthesize a lone "3." or "Mr.".
+    nonisolated static func splitIntoSentences(_ text: String) -> [String] {
+        let flat = text.replacingOccurrences(of: "\n", with: " ")
+        var out: [String] = []
+        var current = ""
+        for ch in flat {
+            current.append(ch)
+            if ".!?".contains(ch) {
+                let trimmed = current.trimmingCharacters(in: .whitespaces)
+                // Merge a very short fragment onto the prior sentence.
+                if trimmed.count <= 3, !out.isEmpty {
+                    out[out.count - 1] += " " + trimmed
+                } else if !trimmed.isEmpty {
+                    out.append(trimmed)
+                }
+                current = ""
+            }
+        }
+        let tail = current.trimmingCharacters(in: .whitespaces)
+        if !tail.isEmpty {
+            if tail.count <= 3, !out.isEmpty { out[out.count - 1] += " " + tail }
+            else { out.append(tail) }
+        }
+        return out
+    }
+
     static func splitIntoChunks(_ text: String, target: Int = 180,
                                 firstChunkTarget: Int = 90) -> [String] {
         let sentences = text
@@ -1331,55 +1446,35 @@ final class VoiceManager: NSObject, ObservableObject {
         return data
     }
 
-    private func playAudio(_ data: Data) throws {
-        // A failed synthesis returns an empty/near-empty WAV; AVAudioPlayer
-        // logs "mDataByteSize (0) should be non-zero" and misbehaves.
-        guard data.count > 1024 else {
-            NSLog("[voice] skipping empty audio buffer (%d bytes)", data.count)
-            finishSpeaking()
-            return
-        }
-        let player = try AVAudioPlayer(data: data)
-        player.delegate = self
-        player.isMeteringEnabled = true
-        audioPlayer = player
-        player.play()
-        meterTimer?.invalidate()
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let p = self.audioPlayer, p.isPlaying else { return }
-                p.updateMeters()
-                // averagePower is dB (-160…0) → 0…1
-                let db = p.averagePower(forChannel: 0)
-                self.level = max(0, min(1, (db + 40) / 40))
-            }
-        }
-    }
-
-    /// Set when the user interrupts. Blocks the streaming pipeline from
-    /// queuing more chunks for this turn — otherwise incoming text restarts
-    /// playback a moment after you press stop.
+    /// Set when the user interrupts. Blocks the pump from queuing more audio
+    /// for this turn — otherwise incoming text restarts playback a moment
+    /// after you press stop.
     private(set) var interrupted = false
 
     /// Stops speech immediately — ESC, the Stop button, the orb, or talking.
     func stopSpeaking() {
-        interrupted = streamActive || state == .speaking
-        streamActive = false
+        interrupted = state == .speaking || speechPump != nil || ttsPrepTask != nil
+        ttsPrepTask?.cancel()
+        ttsPrepTask = nil
+        speechPump?.cancel()
+        speechPump = nil
         serverFetchTask?.cancel()
-        prefetchTask?.cancel()
-        prefetchTask = nil
-        chunkQueue = []
+        prefetch?.cancel()
+        prefetch = nil
+        sentenceQueue = []
         if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
         audioPlayer?.stop()
         audioPlayer = nil
+        resumePlayback()          // unblock the pump's await so it exits
         meterTimer?.invalidate()
         if state == .speaking { state = .idle; level = 0 }
     }
 
     /// True whenever audio is playing OR more is queued — so the Stop control
-    /// stays visible between chunks instead of flickering.
+    /// stays visible between clips instead of flickering.
     var isSpeaking: Bool {
-        state == .speaking || streamActive || audioPlayer != nil || !chunkQueue.isEmpty
+        state == .speaking || audioPlayer != nil
+            || !sentenceQueue.isEmpty || speechPump != nil || ttsPrepTask != nil
     }
 
     // MARK: Level helpers
@@ -1410,8 +1505,8 @@ extension VoiceManager: AVAudioPlayerDelegate {
         Task { @MainActor in
             self.meterTimer?.invalidate()
             self.audioPlayer = nil
-            // Continue with the next sentence chunk, or finish.
-            await self.playNextChunk()
+            // Hand control back to the pump, which starts the next clip.
+            self.resumePlayback()
         }
     }
 }
@@ -1422,6 +1517,10 @@ extension VoiceManager: AVSpeechSynthesizerDelegate {
     }
     nonisolated func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor in
+            // Clears a completed pump reference too, so a system-voice fallback
+            // doesn't leave `isSpeaking` (and the Stop button) stuck on.
+            self.speechPump = nil
+            self.handedToSystemVoice = false
             if self.state == .speaking { self.state = .idle; self.level = 0 }
         }
     }

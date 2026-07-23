@@ -115,7 +115,6 @@ final class ChatStore: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     /// True while the current agent turn was started by voice → speak the reply.
     private var currentTurnViaVoice = false
-    private var streamingSpeechStarted = false
     /// A voice turn is waiting for its reply to be spoken. Survives premature
     /// turn-end markers and history refreshes — cleared only when we actually
     /// speak, when a new message is sent, or after a timeout.
@@ -182,7 +181,6 @@ final class ChatStore: ObservableObject {
         currentTurnViaVoice = viaVoice
         pendingVoiceReply = viaVoice
         pendingVoiceSince = viaVoice ? .now : nil
-        streamingSpeechStarted = false
         // Remember the previous answer so neither streaming nor a history
         // refresh can ever read the OLD reply for the NEW question.
         previousAssistantText = allMessages.last(where: {
@@ -344,16 +342,10 @@ final class ChatStore: ObservableObject {
         }
         if agentBusy { turnCharCount = max(turnCharCount, text.count) }
 
-        // Speak as the reply arrives — but never the PREVIOUS answer
-        // (event replays at turn start used to cause exactly that).
-        if pendingVoiceReply, agentBusy,
-           text != previousAssistantText, text != lastSpokenText {
-            if !streamingSpeechStarted {
-                streamingSpeechStarted = true
-                voice.beginStreamingSpeech()
-            }
-            voice.appendStreamingSpeech(fullTextSoFar: text)
-        }
+        // NOTE: we no longer synthesize per-delta. Speaking is triggered once,
+        // when the turn completes (maybeSpeakPendingReply), so nothing on the
+        // WebSocket hot path does text-cleaning or synthesis. The front end
+        // just renders deltas as they arrive and reacts to the finished reply.
         let isFinal = payload["state"]?.stringValue != "delta"
         if let last = allMessages.last, last.role == .assistant, last.streaming {
             allMessages[allMessages.count - 1].text = text
@@ -445,12 +437,9 @@ final class ChatStore: ObservableObject {
         pendingVoiceReply = false
         currentTurnViaVoice = false
 
-        if streamingSpeechStarted {
-            voice.endStreamingSpeech(fullText: reply)
-        } else {
-            voice.speak(reply)
-        }
-        streamingSpeechStarted = false
+        // Hand the finished reply to the voice manager. All cleaning and
+        // synthesis happen off the main thread from here.
+        voice.speak(reply)
         NSLog("[voice] speaking reply (%d chars)", reply.count)
     }
 

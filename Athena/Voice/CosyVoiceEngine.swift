@@ -171,8 +171,8 @@ final class CosyVoiceEngine: ObservableObject {
     /// The 8 built-in emotion tags. The agent can emit these inline and
     /// CosyVoice will act on them; unknown tags pass through as freeform
     /// instructions, e.g. "(Speak like a pirate)".
-    static let emotions = ["happy", "excited", "sad", "angry",
-                           "whispers", "laughs", "calm", "surprised", "serious"]
+    nonisolated static let emotions = ["happy", "excited", "sad", "angry",
+                                       "whispers", "laughs", "calm", "surprised", "serious"]
 
     var isAvailable: Bool {
         #if canImport(CosyVoiceTTS)

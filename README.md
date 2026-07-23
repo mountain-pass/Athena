@@ -6,25 +6,39 @@ The agent itself (memory, tools, heartbeat, cron) runs on an OpenClaw Gateway �
 
 > Inspired by the [Bailongma](https://bailongma.top) interface, rebuilt natively in SwiftUI, in English.
 
+![Athena — chat, live cognition panel, voice orb, and news](docs/images/athena-screenshot.png)
+
 ---
 
 ## Features
 
 **Chat** — streaming responses, image/video/audio/file attachments, full session history synced from the gateway.
 
-**Voice** — hold `SPACE` anywhere to talk (on-device transcription via `SFSpeechRecognizer`), release to send, spoken reply. Typed messages get typed replies. Three TTS engines:
+**Voice** — hold `SPACE` anywhere to talk, release to send, spoken reply. Typed messages get typed replies; only voice turns are spoken back. Pause as long as you like mid-sentence — the whole recording is transcribed on release.
+
+Speech-to-text (choose in Settings → Voice):
+
+| Engine | Runs where | Notes |
+|---|---|---|
+| Parakeet *(default)* | Local, embedded | Parakeet-TDT on the Apple Neural Engine — accurate on long dictation, tolerant of pauses. ~600 MB, one-time download. Nothing leaves your Mac. |
+| Apple | Local | `SFSpeechRecognizer`, no download. Tuned for short commands; less accurate on long-form speech. |
+
+Text-to-speech:
 
 | Engine | Runs where | Notes |
 |---|---|---|
 | System | Local | macOS voices; download a *Premium* voice for a big quality jump |
 | Kokoro | Local, embedded | Kokoro-82M on Apple Silicon — offline, no server, no Docker |
+| CosyVoice 3 | Local, embedded | Emotional TTS with voice cloning from a recorded sample (macOS 15+) |
 | Server | Remote | Any OpenAI-compatible `/v1/audio/speech` (kokoro-fastapi, CosyVoice) |
+
+Embedded models download once into `~/Library/Application Support`, persist across launches, and load automatically on startup — download progress and a retry are shown in Settings and during first-run setup.
 
 **Live cognition dashboard** — a particle sphere that reacts to real microphone and speech amplitude, a heartbeat ECG that spikes on each agent wake, an action log, a thinking/tool feed, and a stats strip (status, tokens/sec, tokens, messages, ticks).
 
 **News monitor** — a rotating dotted globe with pulsing targets where your stories are happening. Headlines are geo-tagged locally by keyword (no API, no tokens); click a target to see that region's stories. Topic columns flank the globe; RSS/Atom feeds are fetched natively. Add, rename, and delete topics and sources behind the gear. A daily AI brief can be scheduled on the gateway.
 
-**Jobs** — full cron manager for gateway automations: create, edit, enable, run-now, delete. Jobs run on the gateway, so they fire while this Mac sleeps.
+**Jobs** — full cron manager for gateway automations: create from templates or scratch with a plain-English schedule builder, edit, pause/resume, run-now, delete. Each job card shows its schedule, next/last run, and an expandable run history assembled from live gateway events. Jobs run on the gateway, so they fire while this Mac sleeps.
 
 ---
 
@@ -49,13 +63,15 @@ All state lives on the gateway. Athena reconnects with exponential backoff, re-s
 Athena/
 ├── App/          AthenaApp, AppState, MainView, Theme
 ├── Gateway/      WebSocket client, protocol v4, device identity, RPC wrappers
-├── Chat/         ChatStore (streaming + history), ChatView
-├── Voice/        VoiceManager (STT/TTS), KokoroEngine, ParticleSphereView, FileDownloader
+├── Chat/         ChatStore (streaming + history + turn watchdog), ChatView
+├── Voice/        VoiceManager (capture + TTS), ParakeetSTT + AudioSampleBuffer
+│                 (embedded STT), KokoroEngine, CosyVoiceEngine, ModelDownloadRow,
+│                 ParticleSphereView, VoiceHUD, FileDownloader
 ├── News/         NewsStore, RSSFeed parser, GeoTagger, WorldGlobe, NewsView
-├── Jobs/         JobsStore, JobsView (cron)
+├── Jobs/         JobsStore (cron + run history), JobsView, JobEditor, Schedule
 ├── Panels/       ActivityStore, dashboard panels
-├── Setup/        First-run wizard, OpenClaw installer
-└── Settings/     Connection + voice settings
+├── Setup/        First-run wizard, OpenClaw installer, ModelSetupStep
+└── Settings/     Connection + voice/model settings
 ```
 
 ---
@@ -64,8 +80,8 @@ Athena/
 
 ### Requirements
 
-- macOS 14+, Apple Silicon (M1+) for embedded Kokoro
-- Xcode 15+
+- macOS 15+, Apple Silicon (M1+) — embedded Parakeet/Kokoro/CosyVoice run on the Neural Engine / MLX
+- Xcode 16+ (FluidAudio requires a Swift 6 toolchain to compile; the app targets Swift 5.9)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) — `brew install xcodegen`
 - A running [OpenClaw](https://docs.openclaw.ai/install) gateway (Athena can install one for you)
 
@@ -182,6 +198,21 @@ never uses config credentials; pass `--token` explicitly.
 **Kokoro download fails** — it resumes and retries automatically; if it still
 fails, install manually (below).
 
+**"No audio is reaching the microphone"** — the mic tap must be installed at
+the device's *hardware* sample rate (`AVAudioInputNode.inputFormat`), not
+`outputFormat`, which can report a stale 48 kHz while a Bluetooth headset
+delivers 24 kHz. A mismatch makes AVAudioEngine silently fail to create the
+tap. Athena reads the hardware format and, if the device is momentarily busy
+(HAL `error 35`), stops and re-arms the tap once. The console logs
+`[voice] input format (hardware): …` and `[voice] first buffer: …` — if the
+second line never appears, another app is holding the mic.
+
+**Parakeet says "not downloaded" after it clearly downloaded** — detection
+scans both cache locations FluidAudio may use
+(`~/Library/Application Support/FluidAudio/Models` and `~/.cache/fluidaudio`)
+at any nesting depth. Use Settings → Voice → **Clear download** to force a
+clean re-fetch if a download was interrupted.
+
 ### Kokoro manual install
 
 ```bash
@@ -275,7 +306,7 @@ If the answer involves a loop over bytes or a synchronous file read, wrap it in
 - [ ] Native dialogs for exec-approval requests
 - [ ] Real token accounting from the gateway's `usage.*` RPCs
 - [ ] Notifications when the daily brief lands
-- [ ] Streaming token-by-token rendering (currently history-refresh based)
+- [x] Streaming token-by-token rendering
 - [ ] Richer globe: arcs between related stories, day/night terminator
 
 ---
@@ -284,8 +315,10 @@ If the answer involves a loop over bytes or a synchronous file read, wrap it in
 
 - [OpenClaw](https://openclaw.ai) — agent runtime and gateway (the actual brains)
 - [Bailongma](https://bailongma.top) — interface inspiration
+- [FluidAudio](https://github.com/FluidInference/FluidAudio) — embedded Parakeet-TDT speech-to-text on the Neural Engine
 - [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) by hexgrad, via
   [kokoro-swift](https://github.com/mweinbach/kokoro-swift) — embedded TTS
+- [CosyVoice](https://github.com/FunAudioLLM/CosyVoice) — emotional TTS with voice cloning
 - Apple: SwiftUI, Speech, AVFoundation, MLX
 
 ## License
